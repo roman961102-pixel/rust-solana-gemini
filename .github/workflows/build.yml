@@ -1,0 +1,36 @@
+name: Build Release Binary
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-solana--gemini/solana-copy-trader/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-solana--gemini/solana-copy-trader/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release
+        working-directory: rust-solana--gemini/solana-copy-trader
+        run: cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: copy-trader-linux
+          path: rust-solana--gemini/solana-copy-trader/target/release/copy-trader
+          retention-days: 30
