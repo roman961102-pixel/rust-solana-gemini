@@ -1,0 +1,578 @@
+use anyhow::{Context, Result};
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{signature::Signature, transaction::Transaction};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
+
+/// 交易发送器 — 多通道梯度提交（同区块优化版）
+///
+/// 优化要点:
+/// 1. 预序列化交易，所有通道复用同一份 bytes（避免重复序列化）
+/// 2. 所有通道 T+0 并发发送（去掉 50ms 延迟）
+/// 3. fire-and-forget 模式：立即返回，不等待通道结果
+pub struct TxSender {
+    /// 主 RPC (Shyft)
+    primary_rpc: Arc<RpcClient>,
+    /// 备用 RPC (Helius)
+    secondary_rpc: Option<Arc<RpcClient>>,
+    /// Jito block engine URLs (多端点轮换)
+    jito_block_engine_urls: Vec<String>,
+    jito_enabled: bool,
+    http_client: reqwest::Client,
+}
+
+impl TxSender {
+    pub fn new(
+        primary_rpc: Arc<RpcClient>,
+        secondary_rpc_url: Option<String>,
+        jito_block_engine_urls: Vec<String>,
+        jito_enabled: bool,
+    ) -> Self {
+        let secondary_rpc = secondary_rpc_url.map(|url| {
+            Arc::new(RpcClient::new_with_commitment(
+                url,
+                solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            ))
+        });
+
+        Self {
+            primary_rpc,
+            secondary_rpc,
+            jito_block_engine_urls,
+            jito_enabled,
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .pool_max_idle_per_host(4)
+                .build()
+                .unwrap(),
+        }
+    }
+
+    /// 🚀 同区块优化: fire-and-forget 发送
+    /// 预序列化一次，所有通道 T+0 并发，立即返回不等待
+    pub fn fire_and_forget(&self, transaction: &Transaction) -> Result<Signature> {
+        let start = Instant::now();
+
+        // 预序列化交易（只做一次）
+        let tx_bytes = bincode::serialize(transaction)?;
+        let tx_b58 = bs58::encode(&tx_bytes).into_string();
+        let tx_base64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &tx_bytes,
+        );
+
+        // 提取签名（本地操作）
+        let signature = transaction
+            .signatures
+            .first()
+            .copied()
+            .unwrap_or_default();
+
+        let mut channel_count = 0u32;
+
+        // 通道 1: 主 RPC (Shyft) — spawn_blocking
+        {
+            let rpc = self.primary_rpc.clone();
+            let tx = transaction.clone();
+            tokio::task::spawn_blocking(move || {
+                match rpc.send_transaction_with_config(
+                    &tx,
+                    solana_client::rpc_config::RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(sig) => debug!("Shyft RPC 发送成功: {}", sig),
+                    Err(e) => warn!("Shyft RPC 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        // 通道 2: 备用 RPC (Helius)
+        if let Some(rpc2) = &self.secondary_rpc {
+            let rpc2 = rpc2.clone();
+            let tx = transaction.clone();
+            tokio::task::spawn_blocking(move || {
+                match rpc2.send_transaction_with_config(
+                    &tx,
+                    solana_client::rpc_config::RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(sig) => debug!("Helius RPC 发送成功: {}", sig),
+                    Err(e) => debug!("Helius RPC 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        // 通道 3: Jito Bundle — T+0 并发（去掉 50ms 延迟）
+        if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+            let http = self.http_client.clone();
+            let url = self.jito_block_engine_urls[0].clone();
+            let b58 = tx_b58.clone();
+            tokio::spawn(async move {
+                match Self::send_jito_bundle_raw(&http, &url, &b58).await {
+                    Ok(()) => debug!("Jito Bundle 发送成功"),
+                    Err(e) => debug!("Jito Bundle 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        // 通道 4: Jito TX — T+0 并发（不再延迟 50ms）
+        if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
+            let http = self.http_client.clone();
+            let url = self.jito_block_engine_urls[1].clone();
+            let b64 = tx_base64;
+            tokio::spawn(async move {
+                match Self::send_jito_tx_raw(&http, &url, &b64).await {
+                    Ok(()) => debug!("Jito TX 发送成功"),
+                    Err(e) => debug!("Jito TX 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        let elapsed = start.elapsed();
+        info!(
+            "Fire-and-forget: {} 通道已触发 | 耗时: {:?} | sig: {}",
+            channel_count,
+            elapsed,
+            &signature.to_string()[..16],
+        );
+
+        Ok(signature)
+    }
+
+    /// 🚀 Jito Backrun Bundle: [目标tx, 我们的tx] 同区块执行
+    /// 目标交易和我们的交易打包在同一个 bundle，Jito 保证连续执行
+    pub fn fire_and_forget_backrun(
+        &self,
+        target_tx_bytes: &[u8],
+        our_transaction: &Transaction,
+    ) -> Result<Signature> {
+        let start = Instant::now();
+
+        // 验证 target tx 字节有效性
+        if target_tx_bytes.len() < 100 {
+            warn!(
+                "Backrun: 目标交易字节无效 (len={}), 回退普通发送",
+                target_tx_bytes.len(),
+            );
+            return self.fire_and_forget(our_transaction);
+        }
+
+        info!(
+            "Backrun: 目标交易 {} bytes, 准备捆绑发送",
+            target_tx_bytes.len(),
+        );
+
+        // 预序列化我们的交易（Jito sendBundle 要求 base58 编码）
+        let our_tx_bytes = bincode::serialize(our_transaction)?;
+        let our_tx_b58 = bs58::encode(&our_tx_bytes).into_string();
+        let target_tx_b58 = bs58::encode(target_tx_bytes).into_string();
+
+        let signature = our_transaction
+            .signatures
+            .first()
+            .copied()
+            .unwrap_or_default();
+
+        let mut channel_count = 0u32;
+
+        // 通道 1: Jito Backrun Bundle（核心：同区块保证）
+        if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+            let http = self.http_client.clone();
+            let url = self.jito_block_engine_urls[0].clone();
+            let target = target_tx_b58.clone();
+            let ours = our_tx_b58.clone();
+            tokio::spawn(async move {
+                match Self::send_jito_backrun_bundle(&http, &url, &target, &ours).await {
+                    Ok(bundle_id) => info!("Jito Backrun Bundle 发送成功 | bundle: {}", bundle_id),
+                    Err(e) => warn!("Jito Backrun Bundle 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        // 通道 2: 备用 Jito 端点 Backrun Bundle
+        if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
+            let http = self.http_client.clone();
+            let url = self.jito_block_engine_urls[1].clone();
+            let target = target_tx_b58;
+            let ours = our_tx_b58.clone();
+            tokio::spawn(async move {
+                match Self::send_jito_backrun_bundle(&http, &url, &target, &ours).await {
+                    Ok(bundle_id) => debug!("Jito Backrun Bundle (备用) 发送成功 | bundle: {}", bundle_id),
+                    Err(e) => debug!("Jito Backrun Bundle (备用) 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        // 通道 3: 主 RPC 直发（兜底，不保证同区块）
+        {
+            let rpc = self.primary_rpc.clone();
+            let tx = our_transaction.clone();
+            tokio::task::spawn_blocking(move || {
+                match rpc.send_transaction_with_config(
+                    &tx,
+                    solana_client::rpc_config::RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(sig) => debug!("RPC 直发成功: {}", sig),
+                    Err(e) => debug!("RPC 直发失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        let elapsed = start.elapsed();
+        info!(
+            "Backrun fire-and-forget: {} 通道已触发 | 耗时: {:?} | sig: {}",
+            channel_count,
+            elapsed,
+            &signature.to_string()[..16],
+        );
+
+        Ok(signature)
+    }
+
+    /// 原有的等待模式（卖出时使用，需要知道是否成功）
+    pub async fn send_all_channels(&self, transaction: &Transaction) -> Result<SendResult> {
+        self.send_all_channels_with_opts(transaction, true).await
+    }
+
+    pub async fn send_all_channels_with_opts(
+        &self,
+        transaction: &Transaction,
+        skip_preflight: bool,
+    ) -> Result<SendResult> {
+        let start = Instant::now();
+        let mut handles = Vec::new();
+
+        // T+0: 所有通道并发
+        let rpc1 = self.primary_rpc.clone();
+        let tx1 = transaction.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let result = rpc1.send_transaction_with_config(
+                &tx1,
+                solana_client::rpc_config::RpcSendTransactionConfig {
+                    skip_preflight,
+                    ..Default::default()
+                },
+            );
+            ("Shyft RPC", result)
+        }));
+
+        if let Some(rpc2) = &self.secondary_rpc {
+            let rpc2 = rpc2.clone();
+            let tx2 = transaction.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                let result = rpc2.send_transaction_with_config(
+                    &tx2,
+                    solana_client::rpc_config::RpcSendTransactionConfig {
+                        skip_preflight,
+                        ..Default::default()
+                    },
+                );
+                ("Helius RPC", result)
+            }));
+        }
+
+        if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+            let jito_http = self.http_client.clone();
+            let jito_url = self.jito_block_engine_urls[0].clone();
+            let tx3 = transaction.clone();
+            handles.push(tokio::spawn(async move {
+                match Self::send_jito_bundle(&jito_http, &jito_url, &tx3).await {
+                    Ok(()) => ("Jito Bundle", Ok(Signature::default())),
+                    Err(e) => ("Jito Bundle", Err(solana_client::client_error::ClientError::from(
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    ))),
+                }
+            }));
+        }
+
+        // Jito TX — T+0 并发（去掉 50ms 延迟）
+        if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
+            let jito_http = self.http_client.clone();
+            let jito_url = self.jito_block_engine_urls[1].clone();
+            let tx4 = transaction.clone();
+            handles.push(tokio::spawn(async move {
+                match Self::send_jito_tx(&jito_http, &jito_url, &tx4).await {
+                    Ok(()) => ("Jito TX", Ok(Signature::default())),
+                    Err(e) => ("Jito TX", Err(solana_client::client_error::ClientError::from(
+                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    ))),
+                }
+            }));
+        }
+
+        let channel_count = handles.len();
+
+        // 收集结果
+        let mut first_signature: Option<Signature> = None;
+        let mut success_channels = Vec::new();
+        let mut fail_channels = Vec::new();
+
+        for handle in handles {
+            match handle.await {
+                Ok((name, Ok(sig))) => {
+                    if first_signature.is_none() && sig != Signature::default() {
+                        first_signature = Some(sig);
+                    }
+                    success_channels.push(name);
+                }
+                Ok((name, Err(e))) => {
+                    if name.starts_with("Jito") {
+                        debug!("{} 发送失败: {}", name, e);
+                    } else {
+                        warn!("{} 发送失败: {}", name, e);
+                    }
+                    fail_channels.push(name);
+                }
+                Err(e) => {
+                    error!("通道任务错误: {}", e);
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let success = !success_channels.is_empty();
+
+        if success {
+            info!(
+                "发送完成: 成功=[{}] 失败=[{}] | 耗时={:?}",
+                success_channels.join(", "),
+                if fail_channels.is_empty() {
+                    "无".to_string()
+                } else {
+                    fail_channels.join(", ")
+                },
+                elapsed,
+            );
+        } else {
+            error!(
+                "所有通道均失败: [{}] | 耗时={:?}",
+                fail_channels.join(", "),
+                elapsed,
+            );
+        }
+
+        Ok(SendResult {
+            signature: first_signature,
+            success,
+            elapsed,
+            channels_sent: channel_count,
+            channels_succeeded: success_channels.len(),
+        })
+    }
+
+    // ============================================
+    // Jito 发送（预序列化版本，零额外序列化开销）
+    // ============================================
+
+    /// Jito Backrun Bundle: [target_tx, our_tx] — 同区块连续执行
+    /// 返回 bundle_id（用于查询状态）
+    async fn send_jito_backrun_bundle(
+        http_client: &reqwest::Client,
+        block_engine_url: &str,
+        target_tx_b58: &str,
+        our_tx_b58: &str,
+    ) -> Result<String> {
+        let bundle_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [[target_tx_b58, our_tx_b58]]
+        });
+
+        let url = format!("{}/api/v1/bundles", block_engine_url);
+        let resp = http_client
+            .post(&url)
+            .json(&bundle_request)
+            .send()
+            .await
+            .context("Jito Backrun Bundle HTTP 请求失败")?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+        if status.as_u16() == 429 {
+            anyhow::bail!("Jito rate limited");
+        }
+        if !status.is_success() {
+            let detail = body.get("error")
+                .or_else(|| body.get("message"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| body.to_string());
+            anyhow::bail!("Jito Backrun error {}: {}", status, detail);
+        }
+
+        if let Some(error) = body.get("error") {
+            let msg = error.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Jito Backrun error: {}", msg);
+        }
+
+        // 提取 bundle_id
+        let bundle_id = body["result"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+
+        Ok(bundle_id)
+    }
+
+    async fn send_jito_bundle_raw(
+        http_client: &reqwest::Client,
+        block_engine_url: &str,
+        tx_b58: &str,
+    ) -> Result<()> {
+        let bundle_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [[tx_b58]]
+        });
+
+        let url = format!("{}/api/v1/bundles", block_engine_url);
+        let resp = http_client
+            .post(&url)
+            .json(&bundle_request)
+            .send()
+            .await
+            .context("Jito Bundle HTTP 请求失败")?;
+
+        let status = resp.status();
+        if status.as_u16() == 429 {
+            anyhow::bail!("Jito rate limited");
+        }
+        if !status.is_success() {
+            anyhow::bail!("Jito Bundle error: {}", status);
+        }
+
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if let Some(error) = body.get("error") {
+            let msg = error.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Jito Bundle error: {}", msg);
+        }
+
+        Ok(())
+    }
+
+    async fn send_jito_tx_raw(
+        http_client: &reqwest::Client,
+        block_engine_url: &str,
+        tx_base64: &str,
+    ) -> Result<()> {
+        let tx_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": true,
+                    "maxRetries": 0
+                }
+            ]
+        });
+
+        let url = format!("{}/api/v1/transactions", block_engine_url);
+        let resp = http_client
+            .post(&url)
+            .json(&tx_request)
+            .send()
+            .await
+            .context("Jito TX HTTP 请求失败")?;
+
+        let status = resp.status();
+        if status.as_u16() == 429 {
+            anyhow::bail!("Jito TX rate limited");
+        }
+        if !status.is_success() {
+            anyhow::bail!("Jito TX error: {}", status);
+        }
+
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if let Some(error) = body.get("error") {
+            let msg = error.get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Jito TX error: {}", msg);
+        }
+
+        Ok(())
+    }
+
+    // ============================================
+    // Jito 发送（原有 Transaction 版本，卖出用）
+    // ============================================
+
+    async fn send_jito_bundle(
+        http_client: &reqwest::Client,
+        block_engine_url: &str,
+        transaction: &Transaction,
+    ) -> Result<()> {
+        let serialized = bincode::serialize(transaction)
+            .expect("Failed to serialize transaction");
+        let encoded = bs58::encode(&serialized).into_string();
+        Self::send_jito_bundle_raw(http_client, block_engine_url, &encoded).await
+    }
+
+    async fn send_jito_tx(
+        http_client: &reqwest::Client,
+        block_engine_url: &str,
+        transaction: &Transaction,
+    ) -> Result<()> {
+        let serialized = bincode::serialize(transaction)
+            .expect("Failed to serialize transaction");
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &serialized,
+        );
+        Self::send_jito_tx_raw(http_client, block_engine_url, &encoded).await
+    }
+
+    /// 获取随机 Jito tip 账户
+    pub fn random_jito_tip_account(&self) -> solana_sdk::pubkey::Pubkey {
+        use std::str::FromStr;
+        let tip_accounts = [
+            "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+            "HFqU5x63VTqvQss8hp11i4bVqkfRtQ7NmXwkiNPLNiGp",
+            "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+            "ADaUMid9yfUytqMBgopwjb2DTLSDBTg6EZ7NMckRBHYc",
+            "DfXygSm4jCyNCzbzYYVKVXdKP8BYSqLVQNpLKfcku9T2",
+            "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+            "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+            "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        ];
+        let idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as usize)
+            % tip_accounts.len();
+        solana_sdk::pubkey::Pubkey::from_str(tip_accounts[idx]).unwrap()
+    }
+}
+
+#[derive(Debug)]
+pub struct SendResult {
+    pub signature: Option<Signature>,
+    pub success: bool,
+    pub elapsed: Duration,
+    pub channels_sent: usize,
+    pub channels_succeeded: usize,
+}
