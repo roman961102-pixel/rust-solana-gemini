@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -10,6 +11,7 @@ use tracing::{debug, error, info, warn};
 /// 1. 预序列化交易，所有通道复用同一份 bytes（避免重复序列化）
 /// 2. 所有通道 T+0 并发发送
 /// 3. fire-and-forget 模式：立即返回，不等待通道结果
+/// 4. Jito endpoint 轮换：原子计数器分散限频压力
 pub struct TxSender {
     /// 主 RPC URL (Shyft)
     primary_rpc_url: String,
@@ -19,6 +21,8 @@ pub struct TxSender {
     jito_block_engine_urls: Vec<String>,
     jito_enabled: bool,
     http_client: reqwest::Client,
+    /// Jito endpoint 轮换计数器（原子操作，~1ns）
+    jito_url_counter: AtomicUsize,
 }
 
 impl TxSender {
@@ -38,7 +42,24 @@ impl TxSender {
                 .pool_max_idle_per_host(4)
                 .build()
                 .unwrap(),
+            jito_url_counter: AtomicUsize::new(0),
         }
+    }
+
+    /// 获取下一个 Jito endpoint URL（轮换，~1ns）
+    fn next_jito_url(&self) -> &str {
+        let idx = self.jito_url_counter.fetch_add(1, Ordering::Relaxed)
+            % self.jito_block_engine_urls.len();
+        &self.jito_block_engine_urls[idx]
+    }
+
+    /// 获取下一对 Jito endpoint URLs（两个不同 endpoint，用于 Bundle + TX 并发）
+    fn next_jito_url_pair(&self) -> (&str, &str) {
+        let len = self.jito_block_engine_urls.len();
+        let idx = self.jito_url_counter.fetch_add(2, Ordering::Relaxed);
+        let url1 = &self.jito_block_engine_urls[idx % len];
+        let url2 = &self.jito_block_engine_urls[(idx + 1) % len];
+        (url1, url2)
     }
 
     /// 通过 HTTP JSON-RPC sendTransaction 发送原始交易（base64 编码）
@@ -134,32 +155,32 @@ impl TxSender {
             channel_count += 1;
         }
 
-        // 通道 3: Jito Bundle — T+0 并发
+        // 通道 3+4: Jito Bundle + Jito TX — 轮换 endpoint，T+0 并发
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+            let (url1, url2) = self.next_jito_url_pair();
             let http = self.http_client.clone();
-            let url = self.jito_block_engine_urls[0].clone();
+            let jito_url1 = url1.to_string();
             let b58 = tx_b58.clone();
             tokio::spawn(async move {
-                match Self::send_jito_bundle_raw(&http, &url, &b58).await {
+                match Self::send_jito_bundle_raw(&http, &jito_url1, &b58).await {
                     Ok(()) => debug!("Jito Bundle 发送成功"),
                     Err(e) => debug!("Jito Bundle 发送失败: {}", e),
                 }
             });
             channel_count += 1;
-        }
 
-        // 通道 4: Jito TX — T+0 并发
-        if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
-            let http = self.http_client.clone();
-            let url = self.jito_block_engine_urls[1].clone();
-            let b64 = tx_base64;
-            tokio::spawn(async move {
-                match Self::send_jito_tx_raw(&http, &url, &b64).await {
-                    Ok(()) => debug!("Jito TX 发送成功"),
-                    Err(e) => debug!("Jito TX 发送失败: {}", e),
-                }
-            });
-            channel_count += 1;
+            if self.jito_block_engine_urls.len() > 1 {
+                let http = self.http_client.clone();
+                let jito_url2 = url2.to_string();
+                let b64 = tx_base64;
+                tokio::spawn(async move {
+                    match Self::send_jito_tx_raw(&http, &jito_url2, &b64).await {
+                        Ok(()) => debug!("Jito TX 发送成功"),
+                        Err(e) => debug!("Jito TX 发送失败: {}", e),
+                    }
+                });
+                channel_count += 1;
+            }
         }
 
         let elapsed = start.elapsed();
@@ -209,34 +230,35 @@ impl TxSender {
 
         let mut channel_count = 0u32;
 
-        // 通道 1: Jito Backrun Bundle（核心：同区块保证）
+        // 通道 1+2: Jito Backrun Bundle — 轮换 endpoint，两端点并发
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+            let (url1, url2) = self.next_jito_url_pair();
+
             let http = self.http_client.clone();
-            let url = self.jito_block_engine_urls[0].clone();
+            let jito_url1 = url1.to_string();
             let target = target_tx_b58.clone();
             let ours = our_tx_b58.clone();
             tokio::spawn(async move {
-                match Self::send_jito_backrun_bundle(&http, &url, &target, &ours).await {
+                match Self::send_jito_backrun_bundle(&http, &jito_url1, &target, &ours).await {
                     Ok(bundle_id) => info!("Jito Backrun Bundle 发送成功 | bundle: {}", bundle_id),
                     Err(e) => warn!("Jito Backrun Bundle 发送失败: {}", e),
                 }
             });
             channel_count += 1;
-        }
 
-        // 通道 2: 备用 Jito 端点 Backrun Bundle
-        if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
-            let http = self.http_client.clone();
-            let url = self.jito_block_engine_urls[1].clone();
-            let target = target_tx_b58;
-            let ours = our_tx_b58.clone();
-            tokio::spawn(async move {
-                match Self::send_jito_backrun_bundle(&http, &url, &target, &ours).await {
-                    Ok(bundle_id) => debug!("Jito Backrun Bundle (备用) 发送成功 | bundle: {}", bundle_id),
-                    Err(e) => debug!("Jito Backrun Bundle (备用) 发送失败: {}", e),
-                }
-            });
-            channel_count += 1;
+            if self.jito_block_engine_urls.len() > 1 {
+                let http = self.http_client.clone();
+                let jito_url2 = url2.to_string();
+                let target = target_tx_b58;
+                let ours = our_tx_b58.clone();
+                tokio::spawn(async move {
+                    match Self::send_jito_backrun_bundle(&http, &jito_url2, &target, &ours).await {
+                        Ok(bundle_id) => debug!("Jito Backrun Bundle (备用) 发送成功 | bundle: {}", bundle_id),
+                        Err(e) => debug!("Jito Backrun Bundle (备用) 发送失败: {}", e),
+                    }
+                });
+                channel_count += 1;
+            }
         }
 
         // 通道 3: 主 RPC 直发（兜底，不保证同区块）
@@ -310,28 +332,29 @@ impl TxSender {
         }
 
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
+            let (url1, url2) = self.next_jito_url_pair();
+
             let jito_http = self.http_client.clone();
-            let jito_url = self.jito_block_engine_urls[0].clone();
+            let jito_url1 = url1.to_string();
             let b58 = tx_b58;
             handles.push(tokio::spawn(async move {
-                match Self::send_jito_bundle_raw(&jito_http, &jito_url, &b58).await {
+                match Self::send_jito_bundle_raw(&jito_http, &jito_url1, &b58).await {
                     Ok(()) => ("Jito Bundle", Ok(Signature::default())),
                     Err(e) => ("Jito Bundle", Err(e)),
                 }
             }));
-        }
 
-        // Jito TX — T+0 并发
-        if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
-            let jito_http = self.http_client.clone();
-            let jito_url = self.jito_block_engine_urls[1].clone();
-            let b64 = tx_base64;
-            handles.push(tokio::spawn(async move {
-                match Self::send_jito_tx_raw(&jito_http, &jito_url, &b64).await {
-                    Ok(()) => ("Jito TX", Ok(Signature::default())),
-                    Err(e) => ("Jito TX", Err(e)),
-                }
-            }));
+            if self.jito_block_engine_urls.len() > 1 {
+                let jito_http = self.http_client.clone();
+                let jito_url2 = url2.to_string();
+                let b64 = tx_base64;
+                handles.push(tokio::spawn(async move {
+                    match Self::send_jito_tx_raw(&jito_http, &jito_url2, &b64).await {
+                        Ok(()) => ("Jito TX", Ok(Signature::default())),
+                        Err(e) => ("Jito TX", Err(e)),
+                    }
+                }));
+            }
         }
 
         let channel_count = handles.len();

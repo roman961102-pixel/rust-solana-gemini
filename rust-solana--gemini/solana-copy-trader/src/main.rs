@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.3.5");
+    info!("   Solana 跟单交易系统 v1.3.6");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
