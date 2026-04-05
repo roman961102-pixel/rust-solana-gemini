@@ -124,9 +124,9 @@ async fn main() -> Result<()> {
     // 预取缓存（检测信号时预计算 PDA）
     let prefetch_cache = Arc::new(PrefetchCache::new(bc_cache.clone()));
 
-    // 多通道发送器（4 通道 T+0 全并发 fire-and-forget）
+    // 多通道发送器（4 通道 T+0 全并发 fire-and-forget, VersionedTransaction V0）
     let tx_sender = Arc::new(TxSender::new(
-        rpc_client.clone(),
+        config.rpc_url.clone(),
         config.secondary_rpc_url.clone(),
         config.jito_block_engine_urls.clone(),
         config.jito_enabled,
@@ -655,6 +655,7 @@ async fn execute_buy(
                     blockhash,
                     &tip,
                     dyn_config.jito_buy_tip_lamports(),
+                    &[], // ALT: 暂无预部署，后续可接入
                 )
             } else {
                 TxBuilder::build_transaction(
@@ -662,6 +663,7 @@ async fn execute_buy(
                     config,
                     &config.keypair,
                     blockhash,
+                    &[], // ALT: 暂无预部署，后续可接入
                 )
             };
 

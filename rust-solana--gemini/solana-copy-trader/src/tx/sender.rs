@@ -1,21 +1,20 @@
 use anyhow::{Context, Result};
-use solana_client::rpc_client::RpcClient;
-use solana_sdk::{signature::Signature, transaction::Transaction};
-use std::sync::Arc;
+use solana_sdk::{signature::Signature, transaction::VersionedTransaction};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// 交易发送器 — 多通道梯度提交（同区块优化版）
 ///
+/// 全面使用 HTTP JSON-RPC 发送 VersionedTransaction（base64 编码）
 /// 优化要点:
 /// 1. 预序列化交易，所有通道复用同一份 bytes（避免重复序列化）
-/// 2. 所有通道 T+0 并发发送（去掉 50ms 延迟）
+/// 2. 所有通道 T+0 并发发送
 /// 3. fire-and-forget 模式：立即返回，不等待通道结果
 pub struct TxSender {
-    /// 主 RPC (Shyft)
-    primary_rpc: Arc<RpcClient>,
-    /// 备用 RPC (Helius)
-    secondary_rpc: Option<Arc<RpcClient>>,
+    /// 主 RPC URL (Shyft)
+    primary_rpc_url: String,
+    /// 备用 RPC URL (Helius)
+    secondary_rpc_url: Option<String>,
     /// Jito block engine URLs (多端点轮换)
     jito_block_engine_urls: Vec<String>,
     jito_enabled: bool,
@@ -24,21 +23,14 @@ pub struct TxSender {
 
 impl TxSender {
     pub fn new(
-        primary_rpc: Arc<RpcClient>,
+        primary_rpc_url: String,
         secondary_rpc_url: Option<String>,
         jito_block_engine_urls: Vec<String>,
         jito_enabled: bool,
     ) -> Self {
-        let secondary_rpc = secondary_rpc_url.map(|url| {
-            Arc::new(RpcClient::new_with_commitment(
-                url,
-                solana_sdk::commitment_config::CommitmentConfig::confirmed(),
-            ))
-        });
-
         Self {
-            primary_rpc,
-            secondary_rpc,
+            primary_rpc_url,
+            secondary_rpc_url,
             jito_block_engine_urls,
             jito_enabled,
             http_client: reqwest::Client::builder()
@@ -49,12 +41,55 @@ impl TxSender {
         }
     }
 
+    /// 通过 HTTP JSON-RPC sendTransaction 发送原始交易（base64 编码）
+    async fn send_rpc_raw(
+        http_client: &reqwest::Client,
+        rpc_url: &str,
+        tx_base64: &str,
+        skip_preflight: bool,
+    ) -> Result<Signature> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": skip_preflight,
+                    "maxRetries": 0
+                }
+            ]
+        });
+
+        let resp: serde_json::Value = http_client
+            .post(rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .context("RPC sendTransaction HTTP 请求失败")?
+            .json()
+            .await
+            .context("RPC sendTransaction 响应解析失败")?;
+
+        if let Some(error) = resp.get("error") {
+            anyhow::bail!("RPC sendTransaction error: {}", error);
+        }
+
+        let sig_str = resp["result"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("RPC sendTransaction 无签名返回"))?;
+
+        sig_str.parse::<Signature>()
+            .map_err(|e| anyhow::anyhow!("签名解析失败: {}", e))
+    }
+
     /// 🚀 同区块优化: fire-and-forget 发送
     /// 预序列化一次，所有通道 T+0 并发，立即返回不等待
-    pub fn fire_and_forget(&self, transaction: &Transaction) -> Result<Signature> {
+    pub fn fire_and_forget(&self, transaction: &VersionedTransaction) -> Result<Signature> {
         let start = Instant::now();
 
-        // 预序列化交易（只做一次）
+        // 预序列化交易（只做一次，VersionedTransaction 用 bincode 序列化）
         let tx_bytes = bincode::serialize(transaction)?;
         let tx_b58 = bs58::encode(&tx_bytes).into_string();
         let tx_base64 = base64::Engine::encode(
@@ -71,18 +106,13 @@ impl TxSender {
 
         let mut channel_count = 0u32;
 
-        // 通道 1: 主 RPC (Shyft) — spawn_blocking
+        // 通道 1: 主 RPC (Shyft) — HTTP JSON-RPC sendTransaction (base64)
         {
-            let rpc = self.primary_rpc.clone();
-            let tx = transaction.clone();
-            tokio::task::spawn_blocking(move || {
-                match rpc.send_transaction_with_config(
-                    &tx,
-                    solana_client::rpc_config::RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        ..Default::default()
-                    },
-                ) {
+            let http = self.http_client.clone();
+            let url = self.primary_rpc_url.clone();
+            let b64 = tx_base64.clone();
+            tokio::spawn(async move {
+                match Self::send_rpc_raw(&http, &url, &b64, true).await {
                     Ok(sig) => debug!("Shyft RPC 发送成功: {}", sig),
                     Err(e) => warn!("Shyft RPC 发送失败: {}", e),
                 }
@@ -91,17 +121,12 @@ impl TxSender {
         }
 
         // 通道 2: 备用 RPC (Helius)
-        if let Some(rpc2) = &self.secondary_rpc {
-            let rpc2 = rpc2.clone();
-            let tx = transaction.clone();
-            tokio::task::spawn_blocking(move || {
-                match rpc2.send_transaction_with_config(
-                    &tx,
-                    solana_client::rpc_config::RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        ..Default::default()
-                    },
-                ) {
+        if let Some(url2) = &self.secondary_rpc_url {
+            let http = self.http_client.clone();
+            let url2 = url2.clone();
+            let b64 = tx_base64.clone();
+            tokio::spawn(async move {
+                match Self::send_rpc_raw(&http, &url2, &b64, true).await {
                     Ok(sig) => debug!("Helius RPC 发送成功: {}", sig),
                     Err(e) => debug!("Helius RPC 发送失败: {}", e),
                 }
@@ -109,7 +134,7 @@ impl TxSender {
             channel_count += 1;
         }
 
-        // 通道 3: Jito Bundle — T+0 并发（去掉 50ms 延迟）
+        // 通道 3: Jito Bundle — T+0 并发
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let http = self.http_client.clone();
             let url = self.jito_block_engine_urls[0].clone();
@@ -123,7 +148,7 @@ impl TxSender {
             channel_count += 1;
         }
 
-        // 通道 4: Jito TX — T+0 并发（不再延迟 50ms）
+        // 通道 4: Jito TX — T+0 并发
         if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
             let http = self.http_client.clone();
             let url = self.jito_block_engine_urls[1].clone();
@@ -153,7 +178,7 @@ impl TxSender {
     pub fn fire_and_forget_backrun(
         &self,
         target_tx_bytes: &[u8],
-        our_transaction: &Transaction,
+        our_transaction: &VersionedTransaction,
     ) -> Result<Signature> {
         let start = Instant::now();
 
@@ -216,16 +241,14 @@ impl TxSender {
 
         // 通道 3: 主 RPC 直发（兜底，不保证同区块）
         {
-            let rpc = self.primary_rpc.clone();
-            let tx = our_transaction.clone();
-            tokio::task::spawn_blocking(move || {
-                match rpc.send_transaction_with_config(
-                    &tx,
-                    solana_client::rpc_config::RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        ..Default::default()
-                    },
-                ) {
+            let http = self.http_client.clone();
+            let url = self.primary_rpc_url.clone();
+            let b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &our_tx_bytes,
+            );
+            tokio::spawn(async move {
+                match Self::send_rpc_raw(&http, &url, &b64, true).await {
                     Ok(sig) => debug!("RPC 直发成功: {}", sig),
                     Err(e) => debug!("RPC 直发失败: {}", e),
                 }
@@ -245,43 +268,43 @@ impl TxSender {
     }
 
     /// 原有的等待模式（卖出时使用，需要知道是否成功）
-    pub async fn send_all_channels(&self, transaction: &Transaction) -> Result<SendResult> {
+    pub async fn send_all_channels(&self, transaction: &VersionedTransaction) -> Result<SendResult> {
         self.send_all_channels_with_opts(transaction, true).await
     }
 
     pub async fn send_all_channels_with_opts(
         &self,
-        transaction: &Transaction,
+        transaction: &VersionedTransaction,
         skip_preflight: bool,
     ) -> Result<SendResult> {
         let start = Instant::now();
-        let mut handles = Vec::new();
+        let mut handles: Vec<tokio::task::JoinHandle<(&str, Result<Signature>)>> = Vec::new();
 
-        // T+0: 所有通道并发
-        let rpc1 = self.primary_rpc.clone();
-        let tx1 = transaction.clone();
-        handles.push(tokio::task::spawn_blocking(move || {
-            let result = rpc1.send_transaction_with_config(
-                &tx1,
-                solana_client::rpc_config::RpcSendTransactionConfig {
-                    skip_preflight,
-                    ..Default::default()
-                },
-            );
-            ("Shyft RPC", result)
-        }));
+        // 预序列化一次，所有通道复用
+        let tx_bytes = bincode::serialize(transaction)?;
+        let tx_b58 = bs58::encode(&tx_bytes).into_string();
+        let tx_base64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &tx_bytes,
+        );
 
-        if let Some(rpc2) = &self.secondary_rpc {
-            let rpc2 = rpc2.clone();
-            let tx2 = transaction.clone();
-            handles.push(tokio::task::spawn_blocking(move || {
-                let result = rpc2.send_transaction_with_config(
-                    &tx2,
-                    solana_client::rpc_config::RpcSendTransactionConfig {
-                        skip_preflight,
-                        ..Default::default()
-                    },
-                );
+        // T+0: 所有通道并发（全部使用 HTTP JSON-RPC）
+        {
+            let http = self.http_client.clone();
+            let url = self.primary_rpc_url.clone();
+            let b64 = tx_base64.clone();
+            handles.push(tokio::spawn(async move {
+                let result = Self::send_rpc_raw(&http, &url, &b64, skip_preflight).await;
+                ("Shyft RPC", result)
+            }));
+        }
+
+        if let Some(url2) = &self.secondary_rpc_url {
+            let http = self.http_client.clone();
+            let url2 = url2.clone();
+            let b64 = tx_base64.clone();
+            handles.push(tokio::spawn(async move {
+                let result = Self::send_rpc_raw(&http, &url2, &b64, skip_preflight).await;
                 ("Helius RPC", result)
             }));
         }
@@ -289,28 +312,24 @@ impl TxSender {
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let jito_http = self.http_client.clone();
             let jito_url = self.jito_block_engine_urls[0].clone();
-            let tx3 = transaction.clone();
+            let b58 = tx_b58;
             handles.push(tokio::spawn(async move {
-                match Self::send_jito_bundle(&jito_http, &jito_url, &tx3).await {
+                match Self::send_jito_bundle_raw(&jito_http, &jito_url, &b58).await {
                     Ok(()) => ("Jito Bundle", Ok(Signature::default())),
-                    Err(e) => ("Jito Bundle", Err(solana_client::client_error::ClientError::from(
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-                    ))),
+                    Err(e) => ("Jito Bundle", Err(e)),
                 }
             }));
         }
 
-        // Jito TX — T+0 并发（去掉 50ms 延迟）
+        // Jito TX — T+0 并发
         if self.jito_enabled && self.jito_block_engine_urls.len() > 1 {
             let jito_http = self.http_client.clone();
             let jito_url = self.jito_block_engine_urls[1].clone();
-            let tx4 = transaction.clone();
+            let b64 = tx_base64;
             handles.push(tokio::spawn(async move {
-                match Self::send_jito_tx(&jito_http, &jito_url, &tx4).await {
+                match Self::send_jito_tx_raw(&jito_http, &jito_url, &b64).await {
                     Ok(()) => ("Jito TX", Ok(Signature::default())),
-                    Err(e) => ("Jito TX", Err(solana_client::client_error::ClientError::from(
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-                    ))),
+                    Err(e) => ("Jito TX", Err(e)),
                 }
             }));
         }
@@ -515,35 +534,6 @@ impl TxSender {
         }
 
         Ok(())
-    }
-
-    // ============================================
-    // Jito 发送（原有 Transaction 版本，卖出用）
-    // ============================================
-
-    async fn send_jito_bundle(
-        http_client: &reqwest::Client,
-        block_engine_url: &str,
-        transaction: &Transaction,
-    ) -> Result<()> {
-        let serialized = bincode::serialize(transaction)
-            .expect("Failed to serialize transaction");
-        let encoded = bs58::encode(&serialized).into_string();
-        Self::send_jito_bundle_raw(http_client, block_engine_url, &encoded).await
-    }
-
-    async fn send_jito_tx(
-        http_client: &reqwest::Client,
-        block_engine_url: &str,
-        transaction: &Transaction,
-    ) -> Result<()> {
-        let serialized = bincode::serialize(transaction)
-            .expect("Failed to serialize transaction");
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &serialized,
-        );
-        Self::send_jito_tx_raw(http_client, block_engine_url, &encoded).await
     }
 
     /// 获取随机 Jito tip 账户

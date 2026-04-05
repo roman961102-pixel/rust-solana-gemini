@@ -281,9 +281,15 @@ impl SellExecutor {
             Ok(Ok(bh)) => bh,
             _ => { debug!("获取 blockhash 失败，跳过 close ATA"); return; }
         };
-        let msg = solana_sdk::message::Message::new(&[close_ix], Some(&self.config.pubkey));
-        let mut tx = solana_sdk::transaction::Transaction::new_unsigned(msg);
-        tx.sign(&[&*self.config.keypair], blockhash);
+
+        let tx = match crate::tx::builder::TxBuilder::build_simple(
+            &[close_ix],
+            &self.config.keypair,
+            blockhash,
+        ) {
+            Ok(tx) => tx,
+            Err(e) => { debug!("构建 close ATA 交易失败: {}", e); return; }
+        };
 
         let rpc = self.rpc_client.clone();
         match tokio::task::spawn_blocking(move || {
