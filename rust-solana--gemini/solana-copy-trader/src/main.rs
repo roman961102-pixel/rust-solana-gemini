@@ -333,8 +333,9 @@ async fn main() -> Result<()> {
                 &trigger.token_mint,
                 &trigger.wallets,
                 trigger.triggered_at,
-                &[], // ���识模式无目标指令数据
-                &[], // 共识模式��目标交易字节
+                &[], // 共识模式无目标指令数据
+                &[], // 共识模式无目标交易字节
+                false, // 共识模式不做 Backrun
                 &exec_config,
                 &exec_rpc,
                 &exec_pumpfun,
@@ -478,6 +479,7 @@ async fn main() -> Result<()> {
                 trade.detected_at,
                 &trade.instruction_data,
                 &trade.raw_transaction_bytes,
+                trade.is_pre_execution,
                 &config,
                 &rpc_client,
                 &pumpfun,
@@ -540,6 +542,7 @@ async fn execute_buy(
     detected_at: Instant,
     target_instruction_data: &[u8],
     target_raw_tx: &[u8],
+    is_pre_execution: bool,
     config: &AppConfig,
     rpc_client: &Arc<RpcClient>,
     pumpfun: &Arc<PumpfunProcessor>,
@@ -574,33 +577,28 @@ async fn execute_buy(
     let buy_lamports = dyn_config.buy_lamports();
     let sol_price = sol_usd.get();
 
-    // ===== 3 层优先级构建买入指令 =====
-    // 1. BC cache（零 RPC，AMM 精确计算）
-    // 2. 目标指令推算（零 RPC，比例估算，精度较低）
-    // 3. BC RPC fetch（兜底）
+    // ===== 2 层优先级构建买入指令（零 RPC，无兜底）=====
+    // 1. 目标指令推算（零 RPC，从目标钱包指令数据推算价格，最快）
+    // 2. BC cache 命中（零 RPC，AMM 公式精确计算）
+    // 无 BC RPC fetch — 任何 RPC 调用都会毁掉同区块机会
     let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> = if let Some(ref pf) = prefetched {
         if pf.mirror_accounts.is_empty() {
             Err(anyhow::anyhow!("无 mirror_accounts，无法构建指令"))
+        } else if target_instruction_data.len() >= 24 {
+            // ⚡ 最快: 从目标指令数据推算价格（零 RPC，零缓存依赖）
+            pumpfun.buy_from_target_instruction(
+                mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
+                &pf.mirror_accounts, target_instruction_data, config,
+            )
         } else if let Some(bc_state) = bc_cache.get(mint) {
-            // ⚡ 最快 + 最精确: BC cache 命中，用 AMM 公式精确计算
+            // 次选: BC cache 命中，用 AMM 公式精确计算
             let token_amount = bc_state.sol_to_token_quote(buy_lamports);
             pumpfun.buy_from_cached_state(
                 mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
                 &pf.mirror_accounts, &bc_state, config,
             ).map(|mirror| (mirror, token_amount))
-        } else if target_instruction_data.len() >= 24 {
-            // 次选: 从目标指令数据推算价格（零 RPC，比例估算）
-            pumpfun.buy_from_target_instruction(
-                mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
-                &pf.mirror_accounts, target_instruction_data, config,
-            )
         } else {
-            // 慢路径: BC RPC fetch
-            debug!("BC 缓存未命中且无目标指令，RPC 获取状态");
-            pumpfun.buy_with_mirror(
-                mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
-                &pf.mirror_accounts, config,
-            ).await.map(|mirror| (mirror, 0u64))
+            Err(anyhow::anyhow!("无目标指令数据且 BC 缓存未命中，跳过（不做 RPC 兜底）"))
         }
     } else {
         Err(anyhow::anyhow!("无预取数据，跳过"))
@@ -669,8 +667,10 @@ async fn execute_buy(
 
             match tx_result {
                 Ok(transaction) => {
-                    // ⚡ fire-and-forget: Jito Backrun（有目标tx时）或普通发送
-                    let send_result = if !target_raw_tx.is_empty() && config.jito_enabled {
+                    // ⚡ fire-and-forget 发送策略:
+                    // 预执行推送 + 有目标tx + Jito 开启 → Backrun Bundle（同区块）
+                    // 已执行推送（Processed）→ 普通多通道发送（Backrun 必失败）
+                    let send_result = if is_pre_execution && !target_raw_tx.is_empty() && config.jito_enabled {
                         tx_sender.fire_and_forget_backrun(target_raw_tx, &transaction)
                     } else {
                         tx_sender.fire_and_forget(&transaction)

@@ -122,7 +122,7 @@ impl GrpcSubscriber {
                     let recv_time = Instant::now();
 
                     match update.update_oneof {
-                        Some(UpdateOneof::Transaction(tx_info)) => {
+                        Some(UpdateOneof::Transaction(tx_update)) => {
                             total_received += 1;
 
                             // 每 100 笔交易输出统计
@@ -137,13 +137,32 @@ impl GrpcSubscriber {
                                 );
                             }
 
-                            if let Some(ref tx) = tx_info.transaction {
-                                let meta = tx.meta.as_ref();
+                            if let Some(ref tx_info) = tx_update.transaction {
+                                // meta 在 SubscribeUpdateTransactionInfo 层，不在 Transaction 层
+                                let meta = tx_info.meta.as_ref();
+                                let slot = tx_update.slot;
 
-                                match self.parse_transaction(tx, meta, recv_time) {
-                                    Ok(Some(trade)) => {
-                                        total_matched += 1;
-                                        let parse_latency = recv_time.elapsed();
+                                // 诊断: 判断 RabbitStream 是否真正预执行
+                                // 有 meta = 已执行（Processed 级别），无 meta = 预执行
+                                if total_matched == 0 && meta.is_some() {
+                                    warn!(
+                                        "RabbitStream 诊断: meta 存在 → 推送为 Processed 级别（非预执行）| slot={}",
+                                        slot,
+                                    );
+                                } else if total_matched == 0 && meta.is_none() {
+                                    info!(
+                                        "RabbitStream 诊断: meta 为空 → 推送为预执行级别 | slot={}",
+                                        slot,
+                                    );
+                                }
+
+                                if let Some(ref tx_data) = tx_info.transaction {
+                                    let message = tx_data.message.as_ref();
+
+                                    match self.parse_transaction(tx_info, tx_data, message, meta, recv_time) {
+                                        Ok(Some(trade)) => {
+                                            total_matched += 1;
+                                            let parse_latency = recv_time.elapsed();
 
                                         info!(
                                             "DETECTED: {} {} | wallet: {}..{} | sig: {}.. | parse: {:?}",
@@ -164,8 +183,9 @@ impl GrpcSubscriber {
                                     Ok(None) => {
                                         // 不是 DEX swap 交易，跳过
                                     }
-                                    Err(e) => {
-                                        debug!("Parse error (non-fatal): {}", e);
+                                        Err(e) => {
+                                            debug!("Parse error (non-fatal): {}", e);
+                                        }
                                     }
                                 }
                             }
@@ -274,11 +294,11 @@ impl GrpcSubscriber {
     /// 从 gRPC proto Transaction 序列化为 Solana wire format
     /// 用于 Jito Backrun Bundle: [target_tx_bytes, our_tx_bytes]
     /// 使用 yellowstone-grpc-proto 官方转换函数，避免手动重建导致的序列化偏差
+    /// 从 gRPC proto Transaction 序列化为 Solana wire format（用于 Jito Backrun Bundle）
+    /// 仅在匹配成功后调用，避免非匹配交易的序列化开销
     fn serialize_transaction_from_proto(
         tx_data: &yellowstone_grpc_proto::prelude::Transaction,
     ) -> Option<Vec<u8>> {
-        use solana_sdk::transaction::VersionedTransaction;
-
         // 使用 yellowstone 官方的 proto → VersionedTransaction 转换
         let versioned_tx = match yellowstone_grpc_proto::convert_from::create_tx_versioned(
             tx_data.clone(),
@@ -290,34 +310,17 @@ impl GrpcSubscriber {
             }
         };
 
-        // 序列化为 wire format
-        let bytes = match bincode::serialize(&versioned_tx) {
-            Ok(b) => b,
+        // 序列化为 wire format（去掉冗余的反序列化验证，省 ~100µs）
+        match bincode::serialize(&versioned_tx) {
+            Ok(bytes) => {
+                debug!("Backrun: 目标交易序列化 {}bytes", bytes.len());
+                Some(bytes)
+            }
             Err(e) => {
                 warn!("Backrun: VersionedTransaction 序列化失败: {}", e);
-                return None;
-            }
-        };
-
-        // 验证: 反序列化回来确认有效
-        match bincode::deserialize::<VersionedTransaction>(&bytes) {
-            Ok(verified) => {
-                let is_v0 = matches!(verified.message, solana_sdk::message::VersionedMessage::V0(_));
-                debug!(
-                    "Backrun: 目标交易序列化成功 | {}bytes | sigs={} | v0={} | keys={}",
-                    bytes.len(),
-                    verified.signatures.len(),
-                    is_v0,
-                    verified.message.static_account_keys().len(),
-                );
-            }
-            Err(e) => {
-                warn!("Backrun: 序列化后验证失败（反序列化不一致）: {}", e);
-                return None;
+                None
             }
         }
-
-        Some(bytes)
     }
 
     /// 解析 gRPC 接收到的原始交易
@@ -328,27 +331,21 @@ impl GrpcSubscriber {
     ///      例如 Jupiter route → 实际 swap 藏在 inner instructions 里
     fn parse_transaction(
         &self,
-        tx: &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
+        tx_info: &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
+        tx_data: &yellowstone_grpc_proto::prelude::Transaction,
+        message: Option<&yellowstone_grpc_proto::prelude::Message>,
         meta: Option<&yellowstone_grpc_proto::prelude::TransactionStatusMeta>,
         _recv_time: Instant,
     ) -> Result<Option<DetectedTrade>> {
-        let tx_data = tx
-            .transaction
-            .as_ref()
-            .context("Missing transaction data")?;
-        let message = tx_data
-            .message
-            .as_ref()
-            .context("Missing transaction message")?;
+        let message = message.context("Missing transaction message")?;
 
         // 提取目标交易的原始字节（用于构建 Jito Backrun Bundle）
-        // 从 gRPC proto 重新序列化为 Solana wire format
-        let raw_transaction_bytes: Vec<u8> = Self::serialize_transaction_from_proto(tx_data)
-            .unwrap_or_default();
+        // 延迟到匹配成功后再序列化（避免非匹配交易的序列化开销）
+        // raw_transaction_bytes 在匹配成功时通过 serialize_transaction_from_proto 填充
 
         // 提取 signature (base58)
-        let signature = if !tx.signature.is_empty() {
-            bs58::encode(&tx.signature).into_string()
+        let signature = if !tx_info.signature.is_empty() {
+            bs58::encode(&tx_info.signature).into_string()
         } else {
             "unknown".to_string()
         };
@@ -420,20 +417,18 @@ impl GrpcSubscriber {
                 &signature,
                 source_wallet,
             )? {
-                trade.raw_transaction_bytes = raw_transaction_bytes;
+                // 延迟序列化：仅在匹配成功后才序列化目标交易（省 ~400µs/非匹配交易）
+                trade.raw_transaction_bytes = Self::serialize_transaction_from_proto(tx_data)
+                    .unwrap_or_default();
+                // meta 为空 = 预执行（交易尚未被 leader 执行，可 Backrun）
+                trade.is_pre_execution = meta.is_none();
                 return Ok(Some(trade));
             }
         }
 
         // ============================================
         // 第二轮：扫描 inner instructions (CPI 调用)
-        //
-        // 场景：目标钱包通过 Jupiter / 其他聚合器发交易
-        // 顶层指令是聚合器 program，实际 swap 在 inner instructions 里
-        //
-        // 注意：RabbitStream 下 meta.inner_instructions 为空，此轮不会执行
-        // 这意味着通过 Jupiter 等聚合器路由的 Pump.fun 交易无法被检测到
-        // 对于目标钱包直接调用 Pump.fun 的场景不受影响
+        // 场景：通过 Jupiter 等聚合器间接调用 Pump.fun
         // ============================================
         if let Some(m) = meta {
             for inner_group in &m.inner_instructions {
@@ -452,7 +447,10 @@ impl GrpcSubscriber {
                         &signature,
                         source_wallet,
                     )? {
-                        trade.raw_transaction_bytes = raw_transaction_bytes;
+                        trade.raw_transaction_bytes = Self::serialize_transaction_from_proto(tx_data)
+                            .unwrap_or_default();
+                        // inner instructions 来自 meta，所以交易已执行，不可 Backrun
+                        trade.is_pre_execution = false;
                         return Ok(Some(trade));
                     }
                 }
@@ -520,6 +518,7 @@ impl GrpcSubscriber {
             detected_at: Instant::now(),
             sol_amount_lamports,
             raw_transaction_bytes: Vec::new(), // 由 parse_transaction 填充
+            is_pre_execution: false, // 由 parse_transaction 根据 meta 设置
         }))
     }
 

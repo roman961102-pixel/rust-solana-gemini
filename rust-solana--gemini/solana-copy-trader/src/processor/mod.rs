@@ -47,8 +47,9 @@ pub struct DetectedTrade {
     /// 目标钱包的买入 SOL 数量 (lamports)，从指令数据中提取
     pub sol_amount_lamports: u64,
     /// 目标交易的原始序列化字节，用于构建 Jito Bundle
-    /// RabbitStream 下可能为空（序列化失败时），Bundle 构建时需检查
     pub raw_transaction_bytes: Vec<u8>,
+    /// 是否为预执行推送（meta 为空 = 交易尚未被 leader 执行 = 可 Backrun）
+    pub is_pre_execution: bool,
 }
 
 /// 处理器构建的镜像交易指令
