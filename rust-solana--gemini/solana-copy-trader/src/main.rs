@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.5.9");
+    info!("   Solana 跟单交易系统 v1.6.0");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -337,8 +337,16 @@ async fn main() -> Result<()> {
     let exec_dyn_config = dyn_config.clone();
     let exec_tg = tg_notifier.clone();
     let exec_tg_stats = tg_stats.clone();
+    let exec_mint_dedup = mint_dedup.clone();
     tokio::spawn(async move {
         while let Some(trigger) = consensus_rx.recv().await {
+            // 共识触发时插入 mint_dedup，防止重复执行
+            if exec_mint_dedup.contains_key(&trigger.token_mint) {
+                info!("⏭️ 共识触发但代币已买入: {} (60s 内)", &trigger.token_mint.to_string()[..12]);
+                continue;
+            }
+            exec_mint_dedup.insert(trigger.token_mint, Instant::now());
+
             // TG 推送共识达成
             exec_tg.send(TgEvent::ConsensusReached {
                 mint: trigger.token_mint,
@@ -484,11 +492,15 @@ async fn main() -> Result<()> {
         }
 
         // Mint 去重：同一代币 60s 内只买一次
-        if mint_dedup.contains_key(&token_mint) {
-            info!("⏭️ 跳过重复代币: {} (60s 内已买入)", &token_mint.to_string()[..12]);
-            continue;
+        // 即时模式：在执行前拦截，防止同一钱包重复买同一 token
+        // 共识模式：不拦截（多钱包买同一 token 是共识信号），在共识触发时去重
+        if is_instant_mode {
+            if mint_dedup.contains_key(&token_mint) {
+                info!("⏭️ 跳过重复代币: {} (60s 内已买入)", &token_mint.to_string()[..12]);
+                continue;
+            }
+            mint_dedup.insert(token_mint, Instant::now());
         }
-        mint_dedup.insert(token_mint, Instant::now());
 
         // 预取 PDA + 注册 gRPC bonding curve + ATA 监控
         // ATA 提前注册，让 gRPC AccountSubscriber 尽早订阅，
