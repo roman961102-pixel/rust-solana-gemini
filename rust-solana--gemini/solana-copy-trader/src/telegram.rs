@@ -213,7 +213,25 @@ impl TgBot {
         });
         if let Some(k) = kb { body["reply_markup"] = k; }
         match self.http.post(&url).json(&body).send().await {
-            Ok(r) => r.json::<serde_json::Value>().await.ok(),
+            Ok(r) => {
+                let resp = r.json::<serde_json::Value>().await.ok()?;
+                if resp["ok"].as_bool() != Some(true) {
+                    warn!("TG sendMessage 失败: {}", resp);
+                    // 如果带键盘发送失败，尝试纯文本重发
+                    if body.get("reply_markup").is_some() {
+                        warn!("尝试无键盘重发...");
+                        let fallback = serde_json::json!({
+                            "chat_id": self.chat_id, "text": text,
+                            "parse_mode": "HTML", "disable_web_page_preview": true,
+                        });
+                        if let Ok(r2) = self.http.post(&url).json(&fallback).send().await {
+                            return r2.json::<serde_json::Value>().await.ok();
+                        }
+                    }
+                    return None;
+                }
+                Some(resp)
+            }
             Err(e) => { warn!("TG send: {}", e); None }
         }
     }
