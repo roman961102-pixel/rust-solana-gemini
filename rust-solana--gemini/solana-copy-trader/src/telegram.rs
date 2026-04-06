@@ -244,7 +244,9 @@ impl TgBot {
             if let Some(text) = msg["text"].as_str() {
                 let text = text.trim();
                 let parts: Vec<&str> = text.split_whitespace().collect();
-                let cmd = parts.first().copied().unwrap_or("");
+                // 处理 /cmd@botname 格式（Telegram 群组中自动附加）
+                let raw_cmd = parts.first().copied().unwrap_or("");
+                let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
                 match cmd {
                     "/start" => self.cmd_start().await,
                     "/stop" => self.cmd_stop().await,
@@ -507,11 +509,18 @@ impl TgBot {
             return;
         }
         if args.len() < 2 {
-            self.send_msg("用法: /set <key> <value>").await;
+            self.send_msg("用法: /set <key> <value>\n例: /set sl 20").await;
             return;
         }
         let key = args[0].to_lowercase();
-        let val_str = args[1];
+        // 支持 "/set sl = 20%" 和 "/set sl 20" 两种格式
+        let raw_val = if args.len() >= 3 && args[1] == "=" {
+            if args.len() >= 3 { args[2] } else { args[1] }
+        } else {
+            args[1]
+        };
+        // 去掉尾部的 % 符号
+        let val_str = raw_val.trim_end_matches('%');
 
         let result: Result<String, String> = match key.as_str() {
             "buy" => val_str.parse::<f64>().map(|v| { dc.set_buy_sol_amount(v); format!("buy = {} SOL", v) }).map_err(|e| e.to_string()),
