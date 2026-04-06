@@ -413,6 +413,20 @@ impl PumpfunProcessor {
             })
             .collect();
 
+        // 诊断日志：输出 sell 指令的完整账户列表
+        {
+            let fmt = |idx: usize| -> String {
+                replaced.get(idx).map(|p| p.to_string()[..12].to_string()).unwrap_or_else(|| "MISSING".into())
+            };
+            info!(
+                "sell 账户诊断: total={} | [7]sys={} [9]tp={} [11]prog={} [13]fee={}",
+                replaced.len(), fmt(7), fmt(9), fmt(11), fmt(13),
+            );
+            for (i, acct) in replaced.iter().enumerate() {
+                debug!("  sell[{}] = {}", i, acct);
+            }
+        }
+
         let accounts: Vec<AccountMeta> = replaced
             .iter()
             .enumerate()
