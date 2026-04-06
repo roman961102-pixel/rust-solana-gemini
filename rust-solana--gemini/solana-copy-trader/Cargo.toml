@@ -1,6 +1,6 @@
 [package]
 name = "solana-copy-trader"
-version = "1.4.3"
+version = "1.4.4"
 edition = "2021"
 description = "High-performance Solana copy-trading bot in Rust"
 

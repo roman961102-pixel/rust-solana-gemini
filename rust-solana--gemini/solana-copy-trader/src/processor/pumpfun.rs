@@ -366,6 +366,8 @@ impl PumpfunProcessor {
     }
 
     /// 构建 Pump.fun sell 指令（从 mirror_accounts 镜像）
+    /// 精确位置替换：只替换 [5] user_ata、[6] user signer
+    /// remaining accounts 中的 user_volume_accumulator 通过 PDA 推导替换
     pub fn build_sell_instruction_from_mirror(
         &self,
         user: &Pubkey,
@@ -382,15 +384,45 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
-        let replaced = Self::replace_user_pdas(mirror_accounts, source_wallet, user, user_ata);
+        // 精确位置替换（不做通配 PDA 扫描，避免误替换 program ID 等固定地址）
+        let replaced: Vec<Pubkey> = mirror_accounts
+            .iter()
+            .enumerate()
+            .map(|(i, acct)| {
+                match i {
+                    5 => *user_ata,    // user_ata
+                    6 => *user,        // user (signer)
+                    _ if i >= 14 => {
+                        // remaining accounts: 检查是否为 user_volume_accumulator
+                        let (source_uva, _) = Pubkey::find_program_address(
+                            &[b"user_volume_accumulator", source_wallet.as_ref()],
+                            &program_id,
+                        );
+                        if acct == &source_uva {
+                            let (our_uva, _) = Pubkey::find_program_address(
+                                &[b"user_volume_accumulator", user.as_ref()],
+                                &program_id,
+                            );
+                            our_uva
+                        } else {
+                            *acct // bonding_curve_v2 等，不替换
+                        }
+                    }
+                    _ => *acct, // [0-4], [7-13] 全部保留原值
+                }
+            })
+            .collect();
 
         let accounts: Vec<AccountMeta> = replaced
             .iter()
             .enumerate()
             .map(|(i, acct)| {
                 match i {
-                    6 => AccountMeta::new(*acct, true),  // signer
-                    1 | 3 | 4 | 5 | 9 | 13 => AccountMeta::new(*acct, false),
+                    6 => AccountMeta::new(*acct, true),  // user signer
+                    // writable: fee_recipient(1), bc(3), abc(4), ata(5), creator_vault(8)
+                    1 | 3 | 4 | 5 | 8 => AccountMeta::new(*acct, false),
+                    // remaining accounts 中的 UVA 也是 writable
+                    _ if i >= 14 => AccountMeta::new(*acct, false),
                     _ => AccountMeta::new_readonly(*acct, false),
                 }
             })
