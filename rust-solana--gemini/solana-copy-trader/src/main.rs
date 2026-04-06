@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.4.2");
+    info!("   Solana 跟单交易系统 v1.4.3");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -207,6 +207,7 @@ async fn main() -> Result<()> {
         tx_sender.clone(),
         blockhash_cache.clone(),
         auto_sell_manager.clone(),
+        bc_cache.clone(),
         ata_cache.clone(),
         prefetch_cache.clone(),
         account_subscriber.clone(),

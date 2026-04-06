@@ -8,9 +8,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::autosell::{AutoSellManager, SellSignal};
 use crate::config::{AppConfig, DynConfig};
-use crate::grpc::{AccountSubscriber, AtaBalanceCache};
+use crate::grpc::{AccountSubscriber, AtaBalanceCache, BondingCurveCache};
 use crate::processor::prefetch::PrefetchCache;
+use crate::processor::pumpfun::PumpfunProcessor;
 use crate::telegram::{TgEvent, TgNotifier};
+use crate::tx::blockhash::BlockhashCache;
+use crate::tx::builder::TxBuilder;
 use crate::tx::jupiter::JupiterSeller;
 use crate::tx::sender::TxSender;
 
@@ -20,8 +23,11 @@ pub struct SellExecutor {
     config: AppConfig,
     dyn_config: Arc<DynConfig>,
     rpc_client: Arc<RpcClient>,
+    pumpfun: Arc<PumpfunProcessor>,
     tx_sender: Arc<TxSender>,
+    blockhash_cache: BlockhashCache,
     auto_sell: Arc<AutoSellManager>,
+    bc_cache: BondingCurveCache,
     ata_cache: AtaBalanceCache,
     prefetch_cache: Arc<PrefetchCache>,
     account_subscriber: Arc<AccountSubscriber>,
@@ -34,10 +40,11 @@ impl SellExecutor {
         config: AppConfig,
         dyn_config: Arc<DynConfig>,
         rpc_client: Arc<RpcClient>,
-        _pumpfun: Arc<crate::processor::pumpfun::PumpfunProcessor>,
+        pumpfun: Arc<PumpfunProcessor>,
         tx_sender: Arc<TxSender>,
-        _blockhash_cache: crate::tx::blockhash::BlockhashCache,
+        blockhash_cache: BlockhashCache,
         auto_sell: Arc<AutoSellManager>,
+        bc_cache: BondingCurveCache,
         ata_cache: AtaBalanceCache,
         prefetch_cache: Arc<PrefetchCache>,
         account_subscriber: Arc<AccountSubscriber>,
@@ -47,8 +54,11 @@ impl SellExecutor {
             config,
             dyn_config,
             rpc_client,
+            pumpfun,
             tx_sender,
+            blockhash_cache,
             auto_sell,
+            bc_cache,
             ata_cache,
             prefetch_cache,
             account_subscriber,
@@ -57,7 +67,72 @@ impl SellExecutor {
         }
     }
 
-    /// 处理卖出信号（通过 Jupiter API）
+    /// Pump.fun 直接卖出（零外部 API，本地构建指令 → TxBuilder → 多通道发送）
+    async fn try_pumpfun_sell(&self, mint: &Pubkey, token_amount: u64) -> Result<String> {
+        let prefetched = self.prefetch_cache.get(mint)
+            .ok_or_else(|| anyhow::anyhow!("无 prefetch 数据"))?;
+
+        if prefetched.mirror_accounts.is_empty() {
+            anyhow::bail!("无 mirror_accounts");
+        }
+
+        // 从 BC 缓存获取报价（优先），回退到 RPC
+        let bc_state = if let Some(state) = self.bc_cache.get(mint) {
+            state
+        } else {
+            // BC 缓存未命中，尝试 RPC 获取
+            self.pumpfun.prefetch_bonding_curve(&prefetched.bonding_curve).await?
+        };
+
+        if bc_state.complete {
+            anyhow::bail!("bonding curve 已完成（已迁移外盘）");
+        }
+
+        let expected_sol = bc_state.token_to_sol_quote(token_amount);
+        let slippage = self.dyn_config.sell_slippage_bps();
+        let min_sol_output = expected_sol.saturating_sub(expected_sol * slippage / 10_000);
+
+        info!(
+            "Pump.fun 直卖: {} tokens → ~{:.4} SOL (min: {:.4}, slippage: {}bps)",
+            token_amount, expected_sol as f64 / 1e9, min_sol_output as f64 / 1e9, slippage,
+        );
+
+        // 构建 sell 指令
+        let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
+            &self.config.pubkey,
+            &prefetched.user_ata,
+            &prefetched.source_wallet,
+            &prefetched.mirror_accounts,
+            token_amount,
+            min_sol_output,
+        );
+
+        let mirror = crate::processor::MirrorInstruction {
+            swap_instructions: vec![sell_ix],
+            pre_instructions: vec![],
+            post_instructions: vec![],
+            token_mint: *mint,
+            sol_amount: expected_sol,
+        };
+
+        // 构建 VersionedTransaction
+        let (blockhash, _) = self.blockhash_cache.get_sync();
+        let transaction = if self.config.jito_enabled {
+            let tip = self.tx_sender.random_jito_tip_account();
+            TxBuilder::build_jito_bundle_transaction(
+                &mirror, &self.config, &self.config.keypair, blockhash,
+                &tip, self.dyn_config.jito_sell_tip_lamports(), &[],
+            )?
+        } else {
+            TxBuilder::build_transaction(&mirror, &self.config, &self.config.keypair, blockhash, &[])?
+        };
+
+        // 多通道发送（0slot + RPC + Jito）
+        let sig = self.tx_sender.fire_and_forget(&transaction)?;
+        Ok(sig.to_string())
+    }
+
+    /// 处理卖出信号（优先 Pump.fun 直卖，回退 Jupiter）
     pub async fn handle_sell_signal(&self, signal: SellSignal) {
         let sell_start = std::time::Instant::now();
         let mint = signal.token_mint;
@@ -107,36 +182,52 @@ impl SellExecutor {
         let mut success = false;
         let mut last_sig = String::new();
 
+        // === 优先 Pump.fun 直卖（零外部 API，本地构建） ===
         for attempt in 1..=MAX_SELL_RETRIES {
             info!(
-                "Jupiter 卖出尝试 #{}/{}: {}.. (数量: {})",
+                "Pump.fun 直卖尝试 #{}/{}: {}.. (数量: {})",
                 attempt, MAX_SELL_RETRIES,
                 &mint.to_string()[..12], token_balance,
             );
 
-            match self.try_jupiter_sell(&mint, token_balance).await {
+            match self.try_pumpfun_sell(&mint, token_balance).await {
                 Ok(sig) => {
                     info!(
-                        "Jupiter 卖出已提交: https://solscan.io/tx/{} | 构建: {}ms",
+                        "Pump.fun 直卖已提交: https://solscan.io/tx/{} | {}ms",
                         sig, sell_start.elapsed().as_millis(),
                     );
 
-                    // 等待确认
                     let confirmed = self.wait_sell_confirm(&sig, 10).await;
                     if confirmed {
                         info!(
-                            "Jupiter 卖出确认成功: {} | 全流程: {}ms",
+                            "Pump.fun 直卖确认成功: {} | {}ms",
                             &sig[..16], sell_start.elapsed().as_millis(),
                         );
                         last_sig = sig;
                         success = true;
                         break;
                     } else {
-                        warn!("Jupiter 卖出未确认或失败: {} (立即重试)", &sig[..16]);
+                        warn!("Pump.fun 直卖未确认或失败: {} (重试)", &sig[..16]);
                     }
                 }
                 Err(e) => {
-                    warn!("Jupiter 卖出尝试 #{} 失败: {}", attempt, e);
+                    warn!("Pump.fun 直卖尝试 #{} 失败: {} → 回退 Jupiter", attempt, e);
+                    // Pump.fun 直卖失败（如已迁移外盘），回退 Jupiter
+                    match self.try_jupiter_sell(&mint, token_balance).await {
+                        Ok(sig) => {
+                            info!(
+                                "Jupiter 卖出已提交: https://solscan.io/tx/{} | {}ms",
+                                sig, sell_start.elapsed().as_millis(),
+                            );
+                            let confirmed = self.wait_sell_confirm(&sig, 10).await;
+                            if confirmed {
+                                last_sig = sig;
+                                success = true;
+                                break;
+                            }
+                        }
+                        Err(je) => warn!("Jupiter 回退也失败: {}", je),
+                    }
                     if attempt < MAX_SELL_RETRIES {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
@@ -181,7 +272,7 @@ impl SellExecutor {
             // TG 推送卖出失败
             self.tg.send(TgEvent::SellFailed {
                 mint,
-                reason: "Jupiter 卖出重试耗尽".to_string(),
+                reason: "Pump.fun 直卖 + Jupiter 回退均失败".to_string(),
             });
         }
     }

@@ -366,7 +366,7 @@ impl PumpfunProcessor {
     }
 
     /// 构建 Pump.fun sell 指令（从 mirror_accounts 镜像）
-    fn build_sell_instruction_from_mirror(
+    pub fn build_sell_instruction_from_mirror(
         &self,
         user: &Pubkey,
         user_ata: &Pubkey,
