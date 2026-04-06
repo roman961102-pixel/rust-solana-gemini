@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.5.8");
+    info!("   Solana 跟单交易系统 v1.5.9");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -284,7 +284,7 @@ async fn main() -> Result<()> {
     let trade_tx_clone = trade_tx.clone();
     tokio::spawn(async move {
         loop {
-            info!("正在连接 gRPC 交易流...");
+            debug!("正在连接 gRPC 交易流...");
             match grpc_sub.subscribe(trade_tx_clone.clone()).await {
                 Ok(()) => warn!("gRPC 交易流断开，2s 后重连..."),
                 Err(e) => error!("gRPC 交易流错误: {}，2s 后重连...", e),
@@ -298,7 +298,7 @@ async fn main() -> Result<()> {
     let acct_update_tx_clone = account_update_tx.clone();
     tokio::spawn(async move {
         loop {
-            info!("正在连接 gRPC 账户流...");
+            debug!("正在连接 gRPC 账户流...");
             match acct_sub_clone.subscribe(acct_update_tx_clone.clone()).await {
                 Ok(()) => warn!("gRPC 账户流断开，2s 后重连..."),
                 Err(e) => error!("gRPC 账户流错误: {}，2s 后重连...", e),
@@ -685,7 +685,7 @@ async fn execute_buy(
     match buy_result {
         Ok((mirror, _)) => {
             let build_elapsed = start.elapsed();
-            info!("指令构建: {:?}", build_elapsed);
+            debug!("指令构建: {:?}", build_elapsed);
 
             // ⚡ 同步读取 blockhash（零 await 开销）
             let (blockhash, _) = blockhash_cache.get_sync();

@@ -92,7 +92,7 @@ impl GrpcSubscriber {
         // 构建订阅请求
         let subscribe_request = self.build_subscribe_request();
 
-        info!("发送订阅请求...");
+        debug!("发送订阅请求...");
         let (mut subscribe_tx, mut stream) = client
             .subscribe_with_request(Some(subscribe_request))
             .await
@@ -168,14 +168,20 @@ impl GrpcSubscriber {
                                             let parse_latency = recv_time.elapsed();
 
                                         info!(
-                                            "DETECTED: {} {} | wallet: {}..{} | sig: {}.. | parse: {:?}",
+                                            "DETECTED: {} {} | wallet: {}..{} | mint: {} | sol: {:.4} | sig: {}..{}",
                                             trade.trade_type,
                                             if trade.is_buy { "BUY" } else { "SELL" },
                                             &trade.source_wallet.to_string()[..4],
                                             &trade.source_wallet.to_string()
                                                 [trade.source_wallet.to_string().len() - 4..],
-                                            &trade.signature[..12],
-                                            parse_latency,
+                                            if trade.instruction_accounts.len() > 2 {
+                                                trade.instruction_accounts[2].to_string()
+                                            } else {
+                                                format!("{}..{}", &trade.signature[..6], &trade.signature[trade.signature.len()-4..])
+                                            },
+                                            trade.sol_amount_lamports as f64 / 1e9,
+                                            &trade.signature[..8],
+                                            &trade.signature[trade.signature.len()-4..],
                                         );
 
                                         if tx_sender.send(trade).is_err() {
@@ -272,7 +278,7 @@ impl GrpcSubscriber {
             },
         );
 
-        info!("订阅参数: vote=None, failed=None, commitment=None, accounts={}",
+        debug!("订阅参数: vote=None, failed=None, commitment=None, accounts={}",
               transactions.get("target_wallets").map(|t| t.account_include.len()).unwrap_or(0));
 
         SubscribeRequest {

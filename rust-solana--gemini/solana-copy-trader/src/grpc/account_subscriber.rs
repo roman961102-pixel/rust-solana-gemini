@@ -274,7 +274,7 @@ impl AccountSubscriber {
                 _ = resub_interval.tick() => {
                     let current_accounts = self.get_subscribed_addresses();
                     if current_accounts.len() != last_subscribed_count {
-                        info!(
+                        debug!(
                             "动态更新账户订阅: {} → {} 个账户",
                             last_subscribed_count, current_accounts.len(),
                         );
