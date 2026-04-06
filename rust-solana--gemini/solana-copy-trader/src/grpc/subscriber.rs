@@ -111,6 +111,7 @@ impl GrpcSubscriber {
 
         let mut total_received: u64 = 0;
         let mut total_matched: u64 = 0;
+        let mut diagnosed = false;
         let start_time = Instant::now();
 
         // ============================================
@@ -142,18 +143,20 @@ impl GrpcSubscriber {
                                 let meta = tx_info.meta.as_ref();
                                 let slot = tx_update.slot;
 
-                                // 诊断: 判断 RabbitStream 是否真正预执行
-                                // 有 meta = 已执行（Processed 级别），无 meta = 预执行
-                                if total_matched == 0 && meta.is_some() {
-                                    warn!(
-                                        "RabbitStream 诊断: meta 存在 → 推送为 Processed 级别（非预执行）| slot={}",
-                                        slot,
-                                    );
-                                } else if total_matched == 0 && meta.is_none() {
-                                    info!(
-                                        "RabbitStream 诊断: meta 为空 → 推送为预执行级别 | slot={}",
-                                        slot,
-                                    );
+                                // 首次诊断（只打印一次）: 判断 RabbitStream 是否真正预执行
+                                if !diagnosed {
+                                    diagnosed = true;
+                                    if meta.is_some() {
+                                        warn!(
+                                            "RabbitStream 诊断: meta 存在 → Processed 级别（非预执行）| slot={}",
+                                            slot,
+                                        );
+                                    } else {
+                                        info!(
+                                            "RabbitStream 诊断: meta 为空 → 预执行级别 | slot={}",
+                                            slot,
+                                        );
+                                    }
                                 }
 
                                 if let Some(ref tx_data) = tx_info.transaction {
