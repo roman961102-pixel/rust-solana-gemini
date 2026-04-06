@@ -85,6 +85,14 @@ impl AutoSellManager {
         }
     }
 
+    /// 后台修正入场价（从链上 getTransaction 获取真实花费后调用）
+    pub fn update_entry_price(&self, mint: &Pubkey, real_price: f64) {
+        if let Some(mut pos) = self.positions.get_mut(mint) {
+            pos.entry_price_sol = real_price;
+            pos.highest_price = pos.highest_price.max(real_price);
+        }
+    }
+
     /// 标记卖出中
     pub fn mark_selling(&self, mint: &Pubkey) -> bool {
         if let Some(mut pos) = self.positions.get_mut(mint) {

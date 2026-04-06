@@ -274,14 +274,9 @@ impl BuyConfirmer {
                 let bc_price = bc_cache.get(&mint).map(|s| s.price_sol()).filter(|p| *p > 0.0);
                 let current_market_price = bc_price.unwrap_or(0.0);
 
-                // 入场成本价 = 实际花费SOL / 实际代币数（和 GMGN 一致）
-                // 优先从链上交易提取真实花费，回退到 BC 现货价
-                let actual_sol = Self::get_actual_sol_spent(
-                    &rpc_client, signature, &user_pubkey,
-                ).await;
-                let entry_price = if let Some(sol) = actual_sol {
-                    if display_tokens > 0.0 { sol / display_tokens } else { 0.0 }
-                } else if let Some(p) = bc_price {
+                // 入场成本价：先用本地数据立即估算，不等 RPC
+                // BC 现货价最精确（零 RPC），回退到 buy_sol / tokens
+                let entry_price = if let Some(p) = bc_price {
                     p
                 } else if display_tokens > 0.0 {
                     buy_sol / display_tokens
@@ -339,6 +334,30 @@ impl BuyConfirmer {
                     spent_sol: buy_sol,
                     cost_price_usd: cost_usd.clone(),
                     mcap_usd: mcap_str,
+                });
+
+                // 后台异步修正入场价（不阻塞确认流程）
+                // 从链上 getTransaction 提取真实 SOL 花费，修正 entry_price
+                let rpc_bg = rpc_client.clone();
+                let auto_sell_bg = auto_sell.clone();
+                let display_tokens_bg = display_tokens;
+                tokio::spawn(async move {
+                    if let Some(actual_sol) = Self::get_actual_sol_spent(
+                        &rpc_bg, signature, &user_pubkey,
+                    ).await {
+                        let real_price = if display_tokens_bg > 0.0 {
+                            actual_sol / display_tokens_bg
+                        } else {
+                            0.0
+                        };
+                        if real_price > 0.0 {
+                            auto_sell_bg.update_entry_price(&mint, real_price);
+                            debug!(
+                                "入场价修正: {} | {:.10} SOL/token",
+                                &mint.to_string()[..12], real_price,
+                            );
+                        }
+                    }
                 });
             } else if confirmed {
                 warn!(
