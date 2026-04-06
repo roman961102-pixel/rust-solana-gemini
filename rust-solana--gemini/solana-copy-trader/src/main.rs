@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.5.5");
+    info!("   Solana 跟单交易系统 v1.5.6");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -454,8 +454,8 @@ async fn main() -> Result<()> {
         let min_buy_lamports = dyn_config.min_target_buy_lamports();
         if min_buy_lamports > 0 && trade.sol_amount_lamports > 0 {
             if trade.sol_amount_lamports < min_buy_lamports {
-                debug!(
-                    "跳过小额买入: {}.. 买入 {:.4} SOL < 阈值 {:.2} SOL",
+                info!(
+                    "⏭️ 跳过小额买入: {}.. 买入 {:.4} SOL < 阈值 {:.2} SOL",
                     &trade.source_wallet.to_string()[..8],
                     trade.sol_amount_lamports as f64 / 1e9,
                     dyn_config.min_target_buy_sol(),
@@ -468,20 +468,20 @@ async fn main() -> Result<()> {
         let (token_mint, token_program) = match extract_token_info(&trade) {
             Some(info) => info,
             None => {
-                debug!("无法从 accountKeys 提取 mint，跳过");
+                info!("⏭️ 无法从 accountKeys 提取 mint，跳过 sig: {}", &trade.signature[..12]);
                 continue;
             }
         };
 
         // 黑名单检查
         if dyn_config.is_blocked(&token_mint) {
-            debug!("跳过黑名单代币: {}", &token_mint.to_string()[..12]);
+            info!("⏭️ 跳过黑名单代币: {}", &token_mint.to_string()[..12]);
             continue;
         }
 
         // Mint 去重：同一代币 60s 内只买一次
         if mint_dedup.contains_key(&token_mint) {
-            debug!("跳过重复代币: {} (60s 内已买入)", &token_mint.to_string()[..12]);
+            info!("⏭️ 跳过重复代币: {} (60s 内已买入)", &token_mint.to_string()[..12]);
             continue;
         }
         mint_dedup.insert(token_mint, Instant::now());
