@@ -365,14 +365,15 @@ impl PumpfunProcessor {
         }
     }
 
-    /// 构建 Pump.fun sell 指令（从 mirror_accounts 镜像）
-    /// 精确位置替换：只替换 [5] user_ata、[6] user signer
-    /// remaining accounts 中的 user_volume_accumulator 通过 PDA 推导替换
+    /// 构建 Pump.fun sell 指令（从 mirror_accounts 提取代币地址 + 固定常量硬编码）
+    /// buy 和 sell 的 mirror_accounts 布局不同（buy 有 remaining accounts 导致偏移），
+    /// 所以 [7-13] 位置不从 mirror_accounts 取，用固定常量。
+    /// 只从 mirror_accounts 取: [2]mint, [3]bc, [4]assoc_bc, [8]creator_vault
     pub fn build_sell_instruction_from_mirror(
         &self,
         user: &Pubkey,
         user_ata: &Pubkey,
-        source_wallet: &Pubkey,
+        _source_wallet: &Pubkey,
         mirror_accounts: &[Pubkey],
         token_amount: u64,
         min_sol_output: u64,
@@ -384,63 +385,35 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
-        // 精确位置替换（不做通配 PDA 扫描，避免误替换 program ID 等固定地址）
-        let replaced: Vec<Pubkey> = mirror_accounts
-            .iter()
-            .enumerate()
-            .map(|(i, acct)| {
-                match i {
-                    5 => *user_ata,    // user_ata
-                    6 => *user,        // user (signer)
-                    _ if i >= 14 => {
-                        // remaining accounts: 检查是否为 user_volume_accumulator
-                        let (source_uva, _) = Pubkey::find_program_address(
-                            &[b"user_volume_accumulator", source_wallet.as_ref()],
-                            &program_id,
-                        );
-                        if acct == &source_uva {
-                            let (our_uva, _) = Pubkey::find_program_address(
-                                &[b"user_volume_accumulator", user.as_ref()],
-                                &program_id,
-                            );
-                            our_uva
-                        } else {
-                            *acct // bonding_curve_v2 等，不替换
-                        }
-                    }
-                    _ => *acct, // [0-4], [7-13] 全部保留原值
-                }
-            })
-            .collect();
+        // 从 mirror_accounts 取代币相关地址
+        let mint = mirror_accounts[2];
+        let bonding_curve = mirror_accounts[3];
+        let assoc_bc = mirror_accounts[4];
+        // creator_vault: buy 布局中在 [8]（2026 IDL）
+        let creator_vault = mirror_accounts.get(8).copied().unwrap_or(mirror_accounts[3]);
 
-        // 诊断日志：输出 sell 指令的完整账户列表
-        {
-            let fmt = |idx: usize| -> String {
-                replaced.get(idx).map(|p| p.to_string()[..12].to_string()).unwrap_or_else(|| "MISSING".into())
-            };
-            info!(
-                "sell 账户诊断: total={} | [7]sys={} [9]tp={} [11]prog={} [13]fee={}",
-                replaced.len(), fmt(7), fmt(9), fmt(11), fmt(13),
-            );
-            for (i, acct) in replaced.iter().enumerate() {
-                debug!("  sell[{}] = {}", i, acct);
-            }
-        }
+        // 检测 token program: 通过 prefetch 传入的 mirror_accounts[8] 可能是
+        // creator_vault 而非 token_program，所以直接用标准 Token Program
+        // Token-2022 的情况由 prefetch 的 token_program 字段处理
+        let token_prog = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
 
-        let accounts: Vec<AccountMeta> = replaced
-            .iter()
-            .enumerate()
-            .map(|(i, acct)| {
-                match i {
-                    6 => AccountMeta::new(*acct, true),  // user signer
-                    // writable: fee_recipient(1), bc(3), abc(4), ata(5), creator_vault(8)
-                    1 | 3 | 4 | 5 | 8 => AccountMeta::new(*acct, false),
-                    // remaining accounts 中的 UVA 也是 writable
-                    _ if i >= 14 => AccountMeta::new(*acct, false),
-                    _ => AccountMeta::new_readonly(*acct, false),
-                }
-            })
-            .collect();
+        // 固定 14 账户（按 2026 Pump.fun sell IDL 严格排列）
+        let accounts = vec![
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),  // 0
+            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),    // 1
+            AccountMeta::new_readonly(mint, false),                                        // 2
+            AccountMeta::new(bonding_curve, false),                                        // 3
+            AccountMeta::new(assoc_bc, false),                                             // 4
+            AccountMeta::new(*user_ata, false),                                            // 5
+            AccountMeta::new(*user, true),                                                 // 6
+            AccountMeta::new_readonly(system_program::id(), false),                        // 7
+            AccountMeta::new(creator_vault, false),                                        // 8
+            AccountMeta::new_readonly(token_prog, false),                                  // 9
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false), // 10
+            AccountMeta::new_readonly(program_id, false),                                  // 11
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false), // 12
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false), // 13
+        ];
 
         Instruction {
             program_id,
