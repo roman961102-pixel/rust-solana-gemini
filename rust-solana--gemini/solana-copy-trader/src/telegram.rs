@@ -256,8 +256,8 @@ impl TgBot {
                     "/sellall" => self.cmd_sellall().await,
                     "/sellmode" => self.cmd_sellmode().await,
                     "/set" => self.cmd_set(&parts[1..]).await,
-                    "/wallet" => self.cmd_wallet().await,
                     "/wallets" => self.cmd_wallets().await,
+                    "/wallet" => self.cmd_wallet().await,
                     "/addwallet" => self.cmd_addwallet(&parts[1..]).await,
                     "/rmwallet" => self.cmd_rmwallet(&parts[1..]).await,
                     "/block" => self.cmd_block(&parts[1..]).await,
@@ -544,9 +544,12 @@ impl TgBot {
     }
 
     async fn cmd_wallet(&self) {
-        // 显示 SOL 余额
-        let rpc = solana_client::rpc_client::RpcClient::new(self.config.rpc_url.clone());
-        let balance = rpc.get_balance(&self.config.pubkey).unwrap_or(0);
+        let rpc_url = self.config.rpc_url.clone();
+        let pubkey = self.config.pubkey;
+        let balance = tokio::task::spawn_blocking(move || {
+            let rpc = solana_client::rpc_client::RpcClient::new(rpc_url);
+            rpc.get_balance(&pubkey).unwrap_or(0)
+        }).await.unwrap_or(0);
         self.send_msg(&format!(
             "💰 <b>钱包</b>\n\n地址: <code>{}</code>\nSOL: {:.4}",
             self.config.pubkey, balance as f64 / 1e9,
