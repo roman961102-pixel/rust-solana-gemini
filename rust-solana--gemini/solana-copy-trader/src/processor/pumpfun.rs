@@ -368,6 +368,7 @@ impl PumpfunProcessor {
     /// 构建 Pump.fun sell 指令
     /// mirror_accounts 只取 [2]mint, [3]bc, [4]assoc_bc
     /// token_program 和 creator 从 prefetch/bc_cache 动态获取
+    /// is_cashback 控制是否追加 user_volume_accumulator
     pub fn build_sell_instruction_from_mirror(
         &self,
         user: &Pubkey,
@@ -377,6 +378,7 @@ impl PumpfunProcessor {
         min_sol_output: u64,
         token_program_id: &Pubkey,
         creator: &Pubkey,
+        is_cashback: bool,
     ) -> Instruction {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
@@ -385,7 +387,7 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
-        // creator_vault = PDA 派生自 creator（seeds = ["creator-vault", creator]）
+        // PDA 派生
         let creator_vault = Pubkey::find_program_address(
             &[b"creator-vault", creator.as_ref()],
             &program_id,
@@ -396,8 +398,14 @@ impl PumpfunProcessor {
         let bonding_curve = mirror_accounts[3];
         let assoc_bc = mirror_accounts[4];
 
-        // 14 账户（2026 Pump.fun sell IDL）
-        let accounts = vec![
+        // bonding_curve_v2 = PDA 派生（必需的 remaining account）
+        let bonding_curve_v2 = Pubkey::find_program_address(
+            &[b"bonding-curve-v2", mint.as_ref()],
+            &program_id,
+        ).0;
+
+        // 14 固定账户（2026 Pump.fun sell IDL）
+        let mut accounts = vec![
             AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),  // 0  global
             AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),    // 1  fee_recipient
             AccountMeta::new_readonly(mint, false),                                        // 2  mint
@@ -406,13 +414,23 @@ impl PumpfunProcessor {
             AccountMeta::new(*user_ata, false),                                            // 5  user_ata
             AccountMeta::new(*user, true),                                                 // 6  user (signer)
             AccountMeta::new_readonly(system_program::id(), false),                        // 7  system_program
-            AccountMeta::new(*creator, false),                                             // 8  creator_vault
+            AccountMeta::new(creator_vault, false),                                        // 8  creator_vault (PDA)
             AccountMeta::new_readonly(*token_program_id, false),                           // 9  token_program
             AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false), // 10 event_authority
             AccountMeta::new_readonly(program_id, false),                                  // 11 program
             AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false), // 12 fee_config
             AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false), // 13 fee_program
         ];
+
+        // remaining accounts（和 sell_standard 一致）
+        if is_cashback {
+            let (user_vol_acc, _) = Pubkey::find_program_address(
+                &[b"user_volume_accumulator", user.as_ref()],
+                &program_id,
+            );
+            accounts.push(AccountMeta::new(user_vol_acc, false));
+        }
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
 
         Instruction {
             program_id,

@@ -101,7 +101,7 @@ impl SellExecutor {
         let creator = bc_state.creator
             .ok_or_else(|| anyhow::anyhow!("BC 状态无 creator 字段"))?;
 
-        // 构建 sell 指令（token_program 从 prefetch 取，creator 从 BC 取）
+        // 构建 sell 指令（token_program 从 prefetch，creator 从 BC，is_cashback 从 BC）
         let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
             &self.config.pubkey,
             &prefetched.user_ata,
@@ -110,6 +110,7 @@ impl SellExecutor {
             min_sol_output,
             &prefetched.token_program,
             &creator,
+            bc_state.is_cashback,
         );
 
         let mirror = crate::processor::MirrorInstruction {
