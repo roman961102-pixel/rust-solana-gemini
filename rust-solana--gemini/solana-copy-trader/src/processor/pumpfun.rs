@@ -385,7 +385,13 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
-        // 从 mirror_accounts 只取代币相关地址（位置固定）
+        // creator_vault = PDA 派生自 creator（seeds = ["creator-vault", creator]）
+        let creator_vault = Pubkey::find_program_address(
+            &[b"creator-vault", creator.as_ref()],
+            &program_id,
+        ).0;
+
+        // 从 mirror_accounts 只取代币相关地址（位置 [2-4] 跨所有 buy 变体稳定）
         let mint = mirror_accounts[2];
         let bonding_curve = mirror_accounts[3];
         let assoc_bc = mirror_accounts[4];
