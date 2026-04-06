@@ -205,7 +205,14 @@ impl BuyConfirmer {
                     }
                 }
 
-                // --- 两个条件都满足，退出循环 ---
+                // --- ATA 有余额 = 交易已成功上链，立即退出 ---
+                // 不需要再等签名确认：余额变化本身就是链上成功的证明
+                if token_balance > 0 {
+                    confirmed = true;
+                    break;
+                }
+
+                // --- 签名已确认但余额还没到，继续等余额 ---
                 if confirmed && token_balance > 0 {
                     break;
                 }
