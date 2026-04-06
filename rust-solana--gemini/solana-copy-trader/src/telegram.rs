@@ -338,14 +338,14 @@ impl TgBot {
                         self.answer_cb(cb_id, "已删除").await;
                         let updated = self.dyn_config.target_wallets.read().unwrap().clone();
                         if updated.is_empty() {
-                            self.edit_msg(mid, "📭 无跟踪钱包\n\n发送 /addwallet <地址> 添加", None).await;
+                            self.edit_msg(mid, "📭 无跟踪钱包\n\n发送 /addwallet 地址 添加", None).await;
                         } else {
                             let mut text = format!("👛 <b>Smart Money 钱包</b> ({}个)\n\n", updated.len());
                             for (i, w) in updated.iter().enumerate() {
                                 let ws = w.to_string();
                                 text.push_str(&format!("{}. <code>{}..{}</code>\n", i + 1, &ws[..6], &ws[ws.len()-4..]));
                             }
-                            text.push_str("\n发送 /addwallet <地址> 添加\n⚠️ 需重启 gRPC 生效");
+                            text.push_str("\n发送 /addwallet 地址 添加\n⚠️ 需重启 gRPC 生效");
                             let kb = wallets_keyboard(&updated);
                             self.edit_msg(mid, &text, Some(kb)).await;
                         }
@@ -527,7 +527,7 @@ impl TgBot {
             return;
         }
         if args.len() < 2 {
-            self.send_msg("用法: /set <key> <value>\n例: /set sl 20").await;
+            self.send_msg("用法: /set key value\n例: /set sl 20").await;
             return;
         }
         let key = args[0].to_lowercase();
@@ -577,7 +577,7 @@ impl TgBot {
     async fn cmd_wallets(&self) {
         let wallets = self.dyn_config.target_wallets.read().unwrap().clone();
         if wallets.is_empty() {
-            self.send_msg("📭 无跟踪钱包\n\n发送 /addwallet <地址> 添加").await;
+            self.send_msg("📭 无跟踪钱包\n\n发送 /addwallet 地址 添加").await;
             return;
         }
         let mut text = format!("👛 <b>Smart Money 钱包</b> ({}个)\n\n", wallets.len());
@@ -585,14 +585,14 @@ impl TgBot {
             let ws = w.to_string();
             text.push_str(&format!("{}. <code>{}..{}</code>\n", i + 1, &ws[..6], &ws[ws.len()-4..]));
         }
-        text.push_str("\n发送 /addwallet <地址> 添加\n点击下方按钮删除钱包");
+        text.push_str("\n发送 /addwallet 地址 添加\n点击下方按钮删除钱包");
         let kb = wallets_keyboard(&wallets);
         self.send_msg_kb(&text, Some(kb)).await;
     }
 
     async fn cmd_addwallet(&self, args: &[&str]) {
         if args.is_empty() {
-            self.send_msg("用法: /addwallet <地址>").await;
+            self.send_msg("用法: /addwallet 地址").await;
             return;
         }
         let msg = match args[0].parse::<Pubkey>() {
@@ -612,7 +612,7 @@ impl TgBot {
 
     async fn cmd_rmwallet(&self, args: &[&str]) {
         if args.is_empty() {
-            self.send_msg("用法: /rmwallet <地址或序号>").await;
+            self.send_msg("用法: /rmwallet 地址或序号").await;
             return;
         }
         let msg = {
@@ -640,7 +640,7 @@ impl TgBot {
 
     async fn cmd_block(&self, args: &[&str]) {
         if args.is_empty() {
-            self.send_msg("用法: /block <mint>").await;
+            self.send_msg("用法: /block mint地址").await;
             return;
         }
         match args[0].parse::<Pubkey>() {
@@ -654,7 +654,7 @@ impl TgBot {
 
     async fn cmd_unblock(&self, args: &[&str]) {
         if args.is_empty() {
-            self.send_msg("用法: /unblock <mint>").await;
+            self.send_msg("用法: /unblock mint地址").await;
             return;
         }
         match args[0].parse::<Pubkey>() {
