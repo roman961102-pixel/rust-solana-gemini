@@ -97,14 +97,19 @@ impl SellExecutor {
             token_amount, expected_sol as f64 / 1e9, min_sol_output as f64 / 1e9, slippage,
         );
 
-        // 构建 sell 指令
+        // creator 从 BC 状态取（每个代币不同）
+        let creator = bc_state.creator
+            .ok_or_else(|| anyhow::anyhow!("BC 状态无 creator 字段"))?;
+
+        // 构建 sell 指令（token_program 从 prefetch 取，creator 从 BC 取）
         let sell_ix = self.pumpfun.build_sell_instruction_from_mirror(
             &self.config.pubkey,
             &prefetched.user_ata,
-            &prefetched.source_wallet,
             &prefetched.mirror_accounts,
             token_amount,
             min_sol_output,
+            &prefetched.token_program,
+            &creator,
         );
 
         let mirror = crate::processor::MirrorInstruction {

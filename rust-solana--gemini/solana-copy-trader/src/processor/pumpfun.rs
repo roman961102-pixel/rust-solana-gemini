@@ -365,18 +365,18 @@ impl PumpfunProcessor {
         }
     }
 
-    /// 构建 Pump.fun sell 指令（从 mirror_accounts 提取代币地址 + 固定常量硬编码）
-    /// buy 和 sell 的 mirror_accounts 布局不同（buy 有 remaining accounts 导致偏移），
-    /// 所以 [7-13] 位置不从 mirror_accounts 取，用固定常量。
-    /// 只从 mirror_accounts 取: [2]mint, [3]bc, [4]assoc_bc, [8]creator_vault
+    /// 构建 Pump.fun sell 指令
+    /// mirror_accounts 只取 [2]mint, [3]bc, [4]assoc_bc
+    /// token_program 和 creator 从 prefetch/bc_cache 动态获取
     pub fn build_sell_instruction_from_mirror(
         &self,
         user: &Pubkey,
         user_ata: &Pubkey,
-        _source_wallet: &Pubkey,
         mirror_accounts: &[Pubkey],
         token_amount: u64,
         min_sol_output: u64,
+        token_program_id: &Pubkey,
+        creator: &Pubkey,
     ) -> Instruction {
         let program_id = Pubkey::from_str(PUMPFUN_PROGRAM_ID).unwrap();
 
@@ -385,34 +385,27 @@ impl PumpfunProcessor {
         data.extend_from_slice(&token_amount.to_le_bytes());
         data.extend_from_slice(&min_sol_output.to_le_bytes());
 
-        // 从 mirror_accounts 取代币相关地址
+        // 从 mirror_accounts 只取代币相关地址（位置固定）
         let mint = mirror_accounts[2];
         let bonding_curve = mirror_accounts[3];
         let assoc_bc = mirror_accounts[4];
-        // creator_vault: buy 布局中在 [8]（2026 IDL）
-        let creator_vault = mirror_accounts.get(8).copied().unwrap_or(mirror_accounts[3]);
 
-        // 检测 token program: 通过 prefetch 传入的 mirror_accounts[8] 可能是
-        // creator_vault 而非 token_program，所以直接用标准 Token Program
-        // Token-2022 的情况由 prefetch 的 token_program 字段处理
-        let token_prog = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
-
-        // 固定 14 账户（按 2026 Pump.fun sell IDL 严格排列）
+        // 14 账户（2026 Pump.fun sell IDL）
         let accounts = vec![
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),  // 0
-            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),    // 1
-            AccountMeta::new_readonly(mint, false),                                        // 2
-            AccountMeta::new(bonding_curve, false),                                        // 3
-            AccountMeta::new(assoc_bc, false),                                             // 4
-            AccountMeta::new(*user_ata, false),                                            // 5
-            AccountMeta::new(*user, true),                                                 // 6
-            AccountMeta::new_readonly(system_program::id(), false),                        // 7
-            AccountMeta::new(creator_vault, false),                                        // 8
-            AccountMeta::new_readonly(token_prog, false),                                  // 9
-            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false), // 10
-            AccountMeta::new_readonly(program_id, false),                                  // 11
-            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false), // 12
-            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false), // 13
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_GLOBAL).unwrap(), false),  // 0  global
+            AccountMeta::new(Pubkey::from_str(PUMPFUN_FEE_RECIPIENT).unwrap(), false),    // 1  fee_recipient
+            AccountMeta::new_readonly(mint, false),                                        // 2  mint
+            AccountMeta::new(bonding_curve, false),                                        // 3  bonding_curve
+            AccountMeta::new(assoc_bc, false),                                             // 4  assoc_bonding_curve
+            AccountMeta::new(*user_ata, false),                                            // 5  user_ata
+            AccountMeta::new(*user, true),                                                 // 6  user (signer)
+            AccountMeta::new_readonly(system_program::id(), false),                        // 7  system_program
+            AccountMeta::new(*creator, false),                                             // 8  creator_vault
+            AccountMeta::new_readonly(*token_program_id, false),                           // 9  token_program
+            AccountMeta::new_readonly(Pubkey::from_str(PUMPFUN_EVENT_AUTHORITY).unwrap(), false), // 10 event_authority
+            AccountMeta::new_readonly(program_id, false),                                  // 11 program
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_CONFIG_PDA).unwrap(), false), // 12 fee_config
+            AccountMeta::new_readonly(Pubkey::from_str(PUMP_FEE_PROGRAM).unwrap(), false), // 13 fee_program
         ];
 
         Instruction {
