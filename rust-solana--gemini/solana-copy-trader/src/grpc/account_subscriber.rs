@@ -249,7 +249,7 @@ impl AccountSubscriber {
         let mut last_subscribed_count = accounts.len();
 
         // 定时检查新账户的 interval
-        let mut resub_interval = tokio::time::interval(Duration::from_secs(1));
+        let mut resub_interval = tokio::time::interval(Duration::from_millis(200));
         resub_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {

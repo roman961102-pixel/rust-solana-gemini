@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.3.7");
+    info!("   Solana 跟单交易系统 v1.3.8");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -335,8 +335,6 @@ async fn main() -> Result<()> {
                 &trigger.wallets,
                 trigger.triggered_at,
                 &[], // 共识模式无目标指令数据
-                &[], // 共识模式无目标交易字节
-                false, // 共识模式不做 Backrun
                 &exec_config,
                 &exec_rpc,
                 &exec_pumpfun,
@@ -445,7 +443,9 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // 预取 PDA + 注册 gRPC bonding curve 监控
+        // 预取 PDA + 注册 gRPC bonding curve + ATA 监控
+        // ATA 提前注册，让 gRPC AccountSubscriber 尽早订阅，
+        // 这样 BuyConfirmer 能通过 gRPC 缓存快速确认（而非 RPC 轮询）
         let prefetched = prefetch_cache.prefetch_token(
             &token_mint,
             &token_program,
@@ -454,6 +454,7 @@ async fn main() -> Result<()> {
             &config,
         );
         account_subscriber.track_bonding_curve(token_mint, prefetched.bonding_curve);
+        account_subscriber.track_ata(token_mint, prefetched.user_ata);
 
         // ⚡ 同区块模式: min_wallets=1 时直接内联执行，跳过 channel 跳转
         if is_instant_mode {
@@ -479,8 +480,6 @@ async fn main() -> Result<()> {
                 &wallets,
                 trade.detected_at,
                 &trade.instruction_data,
-                &trade.raw_transaction_bytes,
-                trade.is_pre_execution,
                 &config,
                 &rpc_client,
                 &pumpfun,
@@ -542,8 +541,6 @@ async fn execute_buy(
     wallets: &[Pubkey],
     detected_at: Instant,
     target_instruction_data: &[u8],
-    target_raw_tx: &[u8],
-    is_pre_execution: bool,
     config: &AppConfig,
     rpc_client: &Arc<RpcClient>,
     pumpfun: &Arc<PumpfunProcessor>,
@@ -668,14 +665,10 @@ async fn execute_buy(
 
             match tx_result {
                 Ok(transaction) => {
-                    // ⚡ fire-and-forget 发送策略:
-                    // 预执行推送 + 有目标tx + Jito 开启 → Backrun Bundle（同区块）
-                    // 已执行推送（Processed）→ 普通多通道发送（Backrun 必失败）
-                    let send_result = if is_pre_execution && !target_raw_tx.is_empty() && config.jito_enabled {
-                        tx_sender.fire_and_forget_backrun(target_raw_tx, &transaction)
-                    } else {
-                        tx_sender.fire_and_forget(&transaction)
-                    };
+                    // ⚡ fire-and-forget 多通道并发发送
+                    // RabbitStream 为 Processed 级别推送（meta 不填充≠预执行），
+                    // Backrun Bundle 100% 失败，统一走独立TX发送
+                    let send_result = tx_sender.fire_and_forget(&transaction);
                     match send_result {
                         Ok(sig) => {
                             let elapsed = start.elapsed();
@@ -712,30 +705,16 @@ async fn execute_buy(
                                 latency_ms: total_latency.as_millis() as u64,
                             });
 
-                            // 立即建仓 + 注册 gRPC 监控
+                            // 立即建仓（gRPC ATA 监控已在 prefetch 阶段提前注册）
                             if config.auto_sell_enabled {
                                 position.mark_submitted(sig_str);
                                 position.mark_confirming();
                                 auto_sell_manager.add_position(position.clone());
 
-                                // 使用 prefetch 的正确 ATA（兼容 Token-2022）
-                                let user_ata = if let Some(ref pf) = prefetched {
-                                    account_subscriber
-                                        .track_bonding_curve(*mint, pf.bonding_curve);
-                                    pf.user_ata
-                                } else {
-                                    let program_id = Pubkey::from_str(
-                                        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
-                                    )
-                                    .unwrap();
-                                    let (bc, _) = Pubkey::find_program_address(
-                                        &[b"bonding-curve", mint.as_ref()],
-                                        &program_id,
-                                    );
-                                    account_subscriber.track_bonding_curve(*mint, bc);
-                                    get_associated_token_address(&config.pubkey, mint)
-                                };
-                                account_subscriber.track_ata(*mint, user_ata);
+                                let user_ata = prefetched
+                                    .as_ref()
+                                    .map(|pf| pf.user_ata)
+                                    .unwrap_or_else(|| get_associated_token_address(&config.pubkey, mint));
 
                                 // 🔍 主动链上确认：轮询签名状态 → 查 ATA 余额 → 修正真实价格
                                 BuyConfirmer::spawn_confirm_task(
