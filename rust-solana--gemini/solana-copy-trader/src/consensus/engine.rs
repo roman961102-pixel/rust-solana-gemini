@@ -137,6 +137,40 @@ impl ConsensusEngine {
         }
     }
 
+    /// 撤回信号：某钱包卖出了该 token，从共识中移除其买入信号
+    /// 仅在共识未触发时生效（已触发的不可撤回，买入已执行）
+    /// 返回是否成功撤回
+    pub fn revoke_signal(&self, mint: &Pubkey, wallet: &Pubkey) -> bool {
+        if let Some(mut entry) = self.signals.get_mut(mint) {
+            // 已触发的共识不撤回（买入已执行）
+            if entry.triggered {
+                debug!(
+                    "撤回跳过: {} 已触发共识，无法撤回 {}.. 的信号",
+                    &mint.to_string()[..12],
+                    &wallet.to_string()[..8],
+                );
+                return false;
+            }
+
+            let before = entry.signals.len();
+            entry.signals.retain(|s| s.wallet != *wallet);
+            let after = entry.signals.len();
+
+            if before != after {
+                info!(
+                    "共识撤回: {}.. 卖出 {} | 信号 {} → {} / {} 个钱包",
+                    &wallet.to_string()[..8],
+                    &mint.to_string()[..12],
+                    before,
+                    after,
+                    self.min_wallets,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     /// 启动过期信号清理任务（每 10 秒清理一次）
     pub fn start_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
         let signals = self.signals.clone();

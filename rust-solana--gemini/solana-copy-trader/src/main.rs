@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.5.6");
+    info!("   Solana 跟单交易系统 v1.5.7");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -422,12 +422,16 @@ async fn main() -> Result<()> {
         }
         sig_cache.insert(trade.signature.clone(), Instant::now());
 
-        // ===== 跟卖模式：聪明钱卖出 → 触发跟卖 =====
+        // ===== 卖出信号处理 =====
         if !trade.is_buy {
-            if dyn_config.is_follow_sell_mode() {
-                // 从指令提取 mint
-                if let Some((token_mint, _)) = extract_token_info(&trade) {
-                    // 检查是否持有该代币仓位
+            if let Some((token_mint, _)) = extract_token_info(&trade) {
+                // 共识撤回：无论什么模式，钱包卖出时都撤回其共识信号（防止假共识）
+                if !is_instant_mode {
+                    consensus_engine.revoke_signal(&token_mint, &trade.source_wallet);
+                }
+
+                // 跟卖模式：聪明钱卖出 → 触发跟卖
+                if dyn_config.is_follow_sell_mode() {
                     if let Some(pos) = auto_sell_manager.get_position(&token_mint) {
                         if pos.can_sell() {
                             let wallet_str = trade.source_wallet.to_string();
