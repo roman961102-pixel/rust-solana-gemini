@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 /// 2. 所有通道 T+0 并发发送
 /// 3. fire-and-forget 模式：立即返回，不等待通道结果
 /// 4. Jito endpoint 轮换：原子计数器分散限频压力
+/// 5. 0slot staked connection：质押加速，提升同区块率
 pub struct TxSender {
     /// 主 RPC URL (Shyft)
     primary_rpc_url: String,
@@ -22,6 +23,8 @@ pub struct TxSender {
     jito_enabled: bool,
     /// Jito 认证 UUID（x-jito-auth header）
     jito_auth_uuid: Option<String>,
+    /// 0slot staked connection URLs（质押加速，最高优先级通道）
+    zero_slot_urls: Vec<String>,
     http_client: reqwest::Client,
     /// Jito endpoint 轮换计数器（原子操作，~1ns）
     jito_url_counter: AtomicUsize,
@@ -34,6 +37,7 @@ impl TxSender {
         jito_block_engine_urls: Vec<String>,
         jito_enabled: bool,
         jito_auth_uuid: Option<String>,
+        zero_slot_urls: Vec<String>,
     ) -> Self {
         // 追加 bundles.jito.wtf 作为额外 relay 端点（独立限频池）
         let mut urls = jito_block_engine_urls;
@@ -48,12 +52,17 @@ impl TxSender {
             warn!("Jito 未配置认证 UUID，rate limit 将非常低。设置 JITO_AUTH_UUID 环境变量");
         }
 
+        if !zero_slot_urls.is_empty() {
+            info!("0slot 质押加速已配置: {} 个端点", zero_slot_urls.len());
+        }
+
         Self {
             primary_rpc_url,
             secondary_rpc_url,
             jito_block_engine_urls: urls,
             jito_enabled,
             jito_auth_uuid,
+            zero_slot_urls,
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .pool_max_idle_per_host(4)
@@ -144,7 +153,21 @@ impl TxSender {
 
         let mut channel_count = 0u32;
 
-        // 通道 1: 主 RPC (Shyft) — HTTP JSON-RPC sendTransaction (base64)
+        // 通道 0slot: 质押加速（最高优先级，staked connection 直达 leader）
+        for zero_url in &self.zero_slot_urls {
+            let http = self.http_client.clone();
+            let url = zero_url.clone();
+            let b64 = tx_base64.clone();
+            tokio::spawn(async move {
+                match Self::send_rpc_raw(&http, &url, &b64, true).await {
+                    Ok(sig) => info!("0slot 发送成功: {}", sig),
+                    Err(e) => debug!("0slot 发送失败: {}", e),
+                }
+            });
+            channel_count += 1;
+        }
+
+        // 通道 RPC1: 主 RPC (Shyft)
         {
             let http = self.http_client.clone();
             let url = self.primary_rpc_url.clone();
@@ -332,6 +355,19 @@ impl TxSender {
         );
 
         // T+0: 所有通道并发（全部使用 HTTP JSON-RPC）
+
+        // 0slot 质押加速通道（最高优先级）
+        for zero_url in &self.zero_slot_urls {
+            let http = self.http_client.clone();
+            let url = zero_url.clone();
+            let b64 = tx_base64.clone();
+            let sp = skip_preflight;
+            handles.push(tokio::spawn(async move {
+                let result = Self::send_rpc_raw(&http, &url, &b64, sp).await;
+                ("0slot", result)
+            }));
+        }
+
         {
             let http = self.http_client.clone();
             let url = self.primary_rpc_url.clone();

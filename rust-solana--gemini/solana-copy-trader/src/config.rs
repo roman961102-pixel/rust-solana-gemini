@@ -48,6 +48,11 @@ pub struct AppConfig {
     /// VPS 上用 `uuidgen` 生成，填入 .env JITO_AUTH_UUID
     pub jito_auth_uuid: Option<String>,
 
+    // 0slot staked connection（质押加速，提升同区块率）
+    /// 0slot endpoint URLs（带 api-key），逗号分隔
+    /// 例: http://ny1.0slot.trade/?api-key=xxx,http://la1.0slot.trade/?api-key=xxx
+    pub zero_slot_urls: Vec<String>,
+
     // Confirmation
     pub confirm_timeout_secs: u64,
 
@@ -124,6 +129,10 @@ impl AppConfig {
             jito_sell_tip_lamports: env_parse("JITO_SELL_TIP_LAMPORTS",
                 env_parse("JITO_TIP_LAMPORTS", 10_000)),
             jito_auth_uuid: std::env::var("JITO_AUTH_UUID").ok().filter(|s| !s.is_empty()),
+            zero_slot_urls: std::env::var("ZERO_SLOT_URLS")
+                .ok()
+                .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect::<Vec<_>>())
+                .unwrap_or_default(),
             confirm_timeout_secs: env_parse("CONFIRM_TIMEOUT_SECS", 5),
             auto_sell_enabled: env_parse("AUTO_SELL_ENABLED", true),
             take_profit_percent: env_parse("TAKE_PROFIT_PERCENT", 15.0),

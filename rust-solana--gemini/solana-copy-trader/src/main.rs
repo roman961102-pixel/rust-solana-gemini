@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.4.0");
+    info!("   Solana 跟单交易系统 v1.4.1");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -60,7 +60,12 @@ async fn main() -> Result<()> {
         config.consensus_min_wallets, config.consensus_timeout_secs
     );
     info!(
-        "发送通道: Shyft RPC + {} + {} (T+0 全并发)",
+        "发送通道: {} + Shyft RPC + {} + {} (T+0 全并发)",
+        if config.zero_slot_urls.is_empty() {
+            "无0slot"
+        } else {
+            "0slot质押加速"
+        },
         if config.secondary_rpc_url.is_some() {
             "Helius RPC"
         } else {
@@ -126,13 +131,15 @@ async fn main() -> Result<()> {
     // 预取缓存（检测信号时预计算 PDA）
     let prefetch_cache = Arc::new(PrefetchCache::new(bc_cache.clone()));
 
-    // 多通道发送器（4 通道 T+0 全并发 fire-and-forget, VersionedTransaction V0）
+    // 多通道发送器（T+0 全并发 fire-and-forget, VersionedTransaction V0）
+    // 通道: 0slot(质押加速) + Shyft RPC + Helius RPC + Jito Bundle + Jito TX
     let tx_sender = Arc::new(TxSender::new(
         config.rpc_url.clone(),
         config.secondary_rpc_url.clone(),
         config.jito_block_engine_urls.clone(),
         config.jito_enabled,
         config.jito_auth_uuid.clone(),
+        config.zero_slot_urls.clone(),
     ));
 
     // Pump.fun 处理器
