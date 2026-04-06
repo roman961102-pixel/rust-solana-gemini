@@ -141,11 +141,11 @@ impl AutoSellManager {
         self.positions.len()
     }
 
-    /// 获取所有活跃仓位（非 Closed/Failed）
+    /// 获取所有活跃仓位（排除 Closed/Failed/Selling）
     pub fn get_active_positions(&self) -> Vec<Position> {
         self.positions
             .iter()
-            .filter(|p| !matches!(p.state, crate::autosell::PositionState::Closed | crate::autosell::PositionState::Failed))
+            .filter(|p| !matches!(p.state, crate::autosell::PositionState::Closed | crate::autosell::PositionState::Failed | crate::autosell::PositionState::Selling))
             .map(|p| p.value().clone())
             .collect()
     }

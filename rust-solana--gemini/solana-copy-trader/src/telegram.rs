@@ -303,6 +303,38 @@ impl TgBot {
                 let mode_text = if new_mode == SELL_MODE_FOLLOW { "跟卖模式" } else { "止盈止损模式" };
                 self.answer_cb(cb_id, &format!("已切换: {}", mode_text)).await;
                 self.cmd_sellmode_edit(mid).await;
+            } else if let Some(wallet_str) = data.strip_prefix("rmw:") {
+                if let Ok(pk) = wallet_str.parse::<Pubkey>() {
+                    let removed = {
+                        let mut wallets = self.dyn_config.target_wallets.write().unwrap();
+                        if let Some(idx) = wallets.iter().position(|w| w == &pk) {
+                            wallets.remove(idx);
+                            true
+                        } else {
+                            false
+                        }
+                    }; // RwLockWriteGuard dropped here
+                    if removed {
+                        self.answer_cb(cb_id, "已删除").await;
+                        let updated = self.dyn_config.target_wallets.read().unwrap().clone();
+                        if updated.is_empty() {
+                            self.edit_msg(mid, "📭 无跟踪钱包\n\n发送 /addwallet <地址> 添加", None).await;
+                        } else {
+                            let mut text = format!("👛 <b>Smart Money 钱包</b> ({}个)\n\n", updated.len());
+                            for (i, w) in updated.iter().enumerate() {
+                                let ws = w.to_string();
+                                text.push_str(&format!("{}. <code>{}..{}</code>\n", i + 1, &ws[..6], &ws[ws.len()-4..]));
+                            }
+                            text.push_str("\n发送 /addwallet <地址> 添加\n⚠️ 需重启 gRPC 生效");
+                            let kb = wallets_keyboard(&updated);
+                            self.edit_msg(mid, &text, Some(kb)).await;
+                        }
+                    } else {
+                        self.answer_cb(cb_id, "钱包不在列表中").await;
+                    }
+                }
+            } else if data.starts_with("noop:") {
+                self.answer_cb(cb_id, "").await;
             } else if let Some(rest) = data.strip_prefix("buy:") {
                 // buy:LAMPORTS:MINT
                 let parts: Vec<&str> = rest.splitn(2, ':').collect();
@@ -513,19 +545,19 @@ impl TgBot {
     }
 
     async fn cmd_wallets(&self) {
-        let text = {
-            let wallets = self.dyn_config.target_wallets.read().unwrap();
-            if wallets.is_empty() {
-                "📭 无跟踪钱包".to_string()
-            } else {
-                let mut t = "👛 <b>Smart Money 钱包</b>\n\n".to_string();
-                for (i, w) in wallets.iter().enumerate() {
-                    t.push_str(&format!("{}. <code>{}</code>\n", i + 1, w));
-                }
-                t
-            }
-        };
-        self.send_msg(&text).await;
+        let wallets = self.dyn_config.target_wallets.read().unwrap().clone();
+        if wallets.is_empty() {
+            self.send_msg("📭 无跟踪钱包\n\n发送 /addwallet <地址> 添加").await;
+            return;
+        }
+        let mut text = format!("👛 <b>Smart Money 钱包</b> ({}个)\n\n", wallets.len());
+        for (i, w) in wallets.iter().enumerate() {
+            let ws = w.to_string();
+            text.push_str(&format!("{}. <code>{}..{}</code>\n", i + 1, &ws[..6], &ws[ws.len()-4..]));
+        }
+        text.push_str("\n发送 /addwallet <地址> 添加\n点击下方按钮删除钱包");
+        let kb = wallets_keyboard(&wallets);
+        self.send_msg_kb(&text, Some(kb)).await;
     }
 
     async fn cmd_addwallet(&self, args: &[&str]) {
@@ -852,7 +884,7 @@ fn position_keyboard(mint_str: &str) -> serde_json::Value {
     })
 }
 
-/// 持仓列表键盘：每个代币一行卖出按钮 + 底部刷新
+/// 持仓列表键盘：每个代币一行名称 + 分档卖出按钮 + 底部刷新
 fn position_list_keyboard(positions: &[crate::autosell::Position]) -> serde_json::Value {
     let mut rows: Vec<serde_json::Value> = Vec::new();
     for pos in positions {
@@ -860,16 +892,41 @@ fn position_list_keyboard(positions: &[crate::autosell::Position]) -> serde_json
         let name = if pos.token_name.is_empty() {
             format!("{}..{}", &ms[..6], &ms[ms.len()-4..])
         } else {
-            pos.token_name.clone()
+            if pos.token_name.len() > 10 {
+                format!("{}...", &pos.token_name[..10])
+            } else {
+                pos.token_name.clone()
+            }
         };
+        // 代币名称行
         rows.push(serde_json::json!([
-            {"text": format!("卖出 {}", name), "callback_data": format!("sell:100:{}", ms)},
+            {"text": format!("📌 {}", name), "callback_data": format!("noop:{}", ms)},
             {"text": "📊", "url": format!("https://gmgn.ai/sol/token/{}", ms)},
+        ]));
+        // 分档卖出按钮行
+        rows.push(serde_json::json!([
+            {"text": "20%", "callback_data": format!("sell:20:{}", ms)},
+            {"text": "50%", "callback_data": format!("sell:50:{}", ms)},
+            {"text": "75%", "callback_data": format!("sell:75:{}", ms)},
+            {"text": "全部", "callback_data": format!("sell:100:{}", ms)},
         ]));
     }
     rows.push(serde_json::json!([
         {"text": "🔄 刷新列表", "callback_data": "refresh_pos_list"},
     ]));
+    serde_json::json!({"inline_keyboard": rows})
+}
+
+/// 钱包列表键盘：每个钱包一个删除按钮
+fn wallets_keyboard(wallets: &[Pubkey]) -> serde_json::Value {
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for (i, w) in wallets.iter().enumerate() {
+        let ws = w.to_string();
+        let short = format!("{}..{}", &ws[..6], &ws[ws.len()-4..]);
+        rows.push(serde_json::json!([
+            {"text": format!("❌ 删除 #{} {}", i + 1, short), "callback_data": format!("rmw:{}", ws)},
+        ]));
+    }
     serde_json::json!({"inline_keyboard": rows})
 }
 
