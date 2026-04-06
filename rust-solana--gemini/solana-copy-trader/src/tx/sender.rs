@@ -20,6 +20,8 @@ pub struct TxSender {
     /// Jito block engine URLs (多端点轮换)
     jito_block_engine_urls: Vec<String>,
     jito_enabled: bool,
+    /// Jito 认证 UUID（x-jito-auth header）
+    jito_auth_uuid: Option<String>,
     http_client: reqwest::Client,
     /// Jito endpoint 轮换计数器（原子操作，~1ns）
     jito_url_counter: AtomicUsize,
@@ -31,12 +33,27 @@ impl TxSender {
         secondary_rpc_url: Option<String>,
         jito_block_engine_urls: Vec<String>,
         jito_enabled: bool,
+        jito_auth_uuid: Option<String>,
     ) -> Self {
+        // 追加 bundles.jito.wtf 作为额外 relay 端点（独立限频池）
+        let mut urls = jito_block_engine_urls;
+        let relay = "https://bundles.jito.wtf".to_string();
+        if !urls.contains(&relay) {
+            urls.push(relay);
+        }
+
+        if jito_auth_uuid.is_some() {
+            info!("Jito 认证已配置 (x-jito-auth UUID)");
+        } else {
+            warn!("Jito 未配置认证 UUID，rate limit 将非常低。设置 JITO_AUTH_UUID 环境变量");
+        }
+
         Self {
             primary_rpc_url,
             secondary_rpc_url,
-            jito_block_engine_urls,
+            jito_block_engine_urls: urls,
             jito_enabled,
+            jito_auth_uuid,
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .pool_max_idle_per_host(4)
@@ -158,11 +175,13 @@ impl TxSender {
         // 通道 3+4: Jito Bundle + Jito TX — 轮换 endpoint，T+0 并发
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
+            let auth = self.jito_auth_uuid.clone();
             let http = self.http_client.clone();
             let jito_url1 = url1.to_string();
+            let auth1 = auth.clone();
             let b58 = tx_b58.clone();
             tokio::spawn(async move {
-                match Self::send_jito_bundle_raw(&http, &jito_url1, &b58).await {
+                match Self::send_jito_bundle_raw(&http, &jito_url1, &b58, &auth1).await {
                     Ok(()) => debug!("Jito Bundle 发送成功"),
                     Err(e) => debug!("Jito Bundle 发送失败: {}", e),
                 }
@@ -174,7 +193,7 @@ impl TxSender {
                 let jito_url2 = url2.to_string();
                 let b64 = tx_base64;
                 tokio::spawn(async move {
-                    match Self::send_jito_tx_raw(&http, &jito_url2, &b64).await {
+                    match Self::send_jito_tx_raw(&http, &jito_url2, &b64, &auth).await {
                         Ok(()) => debug!("Jito TX 发送成功"),
                         Err(e) => debug!("Jito TX 发送失败: {}", e),
                     }
@@ -233,13 +252,15 @@ impl TxSender {
         // 通道 1+2: Jito Backrun Bundle — 轮换 endpoint，两端点并发
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
+            let auth = self.jito_auth_uuid.clone();
 
             let http = self.http_client.clone();
             let jito_url1 = url1.to_string();
+            let auth1 = auth.clone();
             let target = target_tx_b58.clone();
             let ours = our_tx_b58.clone();
             tokio::spawn(async move {
-                match Self::send_jito_backrun_bundle(&http, &jito_url1, &target, &ours).await {
+                match Self::send_jito_backrun_bundle(&http, &jito_url1, &target, &ours, &auth1).await {
                     Ok(bundle_id) => info!("Jito Backrun Bundle 发送成功 | bundle: {}", bundle_id),
                     Err(e) => warn!("Jito Backrun Bundle 发送失败: {}", e),
                 }
@@ -252,7 +273,7 @@ impl TxSender {
                 let target = target_tx_b58;
                 let ours = our_tx_b58.clone();
                 tokio::spawn(async move {
-                    match Self::send_jito_backrun_bundle(&http, &jito_url2, &target, &ours).await {
+                    match Self::send_jito_backrun_bundle(&http, &jito_url2, &target, &ours, &auth).await {
                         Ok(bundle_id) => debug!("Jito Backrun Bundle (备用) 发送成功 | bundle: {}", bundle_id),
                         Err(e) => debug!("Jito Backrun Bundle (备用) 发送失败: {}", e),
                     }
@@ -333,12 +354,14 @@ impl TxSender {
 
         if self.jito_enabled && !self.jito_block_engine_urls.is_empty() {
             let (url1, url2) = self.next_jito_url_pair();
+            let auth = self.jito_auth_uuid.clone();
 
             let jito_http = self.http_client.clone();
             let jito_url1 = url1.to_string();
+            let auth1 = auth.clone();
             let b58 = tx_b58;
             handles.push(tokio::spawn(async move {
-                match Self::send_jito_bundle_raw(&jito_http, &jito_url1, &b58).await {
+                match Self::send_jito_bundle_raw(&jito_http, &jito_url1, &b58, &auth1).await {
                     Ok(()) => ("Jito Bundle", Ok(Signature::default())),
                     Err(e) => ("Jito Bundle", Err(e)),
                 }
@@ -349,7 +372,7 @@ impl TxSender {
                 let jito_url2 = url2.to_string();
                 let b64 = tx_base64;
                 handles.push(tokio::spawn(async move {
-                    match Self::send_jito_tx_raw(&jito_http, &jito_url2, &b64).await {
+                    match Self::send_jito_tx_raw(&jito_http, &jito_url2, &b64, &auth).await {
                         Ok(()) => ("Jito TX", Ok(Signature::default())),
                         Err(e) => ("Jito TX", Err(e)),
                     }
@@ -421,6 +444,20 @@ impl TxSender {
     // Jito 发送（预序列化版本，零额外序列化开销）
     // ============================================
 
+    /// 构建带认证的 Jito HTTP 请求
+    fn jito_request(
+        http_client: &reqwest::Client,
+        url: &str,
+        body: &serde_json::Value,
+        auth_uuid: &Option<String>,
+    ) -> reqwest::RequestBuilder {
+        let mut req = http_client.post(url).json(body);
+        if let Some(uuid) = auth_uuid {
+            req = req.header("x-jito-auth", uuid);
+        }
+        req
+    }
+
     /// Jito Backrun Bundle: [target_tx, our_tx] — 同区块连续执行
     /// 返回 bundle_id（用于查询状态）
     async fn send_jito_backrun_bundle(
@@ -428,6 +465,7 @@ impl TxSender {
         block_engine_url: &str,
         target_tx_b58: &str,
         our_tx_b58: &str,
+        auth_uuid: &Option<String>,
     ) -> Result<String> {
         let bundle_request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -437,9 +475,7 @@ impl TxSender {
         });
 
         let url = format!("{}/api/v1/bundles", block_engine_url);
-        let resp = http_client
-            .post(&url)
-            .json(&bundle_request)
+        let resp = Self::jito_request(http_client, &url, &bundle_request, auth_uuid)
             .send()
             .await
             .context("Jito Backrun Bundle HTTP 请求失败")?;
@@ -478,6 +514,7 @@ impl TxSender {
         http_client: &reqwest::Client,
         block_engine_url: &str,
         tx_b58: &str,
+        auth_uuid: &Option<String>,
     ) -> Result<()> {
         let bundle_request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -487,9 +524,7 @@ impl TxSender {
         });
 
         let url = format!("{}/api/v1/bundles", block_engine_url);
-        let resp = http_client
-            .post(&url)
-            .json(&bundle_request)
+        let resp = Self::jito_request(http_client, &url, &bundle_request, auth_uuid)
             .send()
             .await
             .context("Jito Bundle HTTP 请求失败")?;
@@ -517,6 +552,7 @@ impl TxSender {
         http_client: &reqwest::Client,
         block_engine_url: &str,
         tx_base64: &str,
+        auth_uuid: &Option<String>,
     ) -> Result<()> {
         let tx_request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -533,9 +569,7 @@ impl TxSender {
         });
 
         let url = format!("{}/api/v1/transactions", block_engine_url);
-        let resp = http_client
-            .post(&url)
-            .json(&tx_request)
+        let resp = Self::jito_request(http_client, &url, &tx_request, auth_uuid)
             .send()
             .await
             .context("Jito TX HTTP 请求失败")?;

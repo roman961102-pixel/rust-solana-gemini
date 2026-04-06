@@ -44,6 +44,9 @@ pub struct AppConfig {
     pub jito_block_engine_urls: Vec<String>,
     pub jito_buy_tip_lamports: u64,
     pub jito_sell_tip_lamports: u64,
+    /// Jito 认证 UUID（x-jito-auth header），大幅提升 rate limit
+    /// VPS 上用 `uuidgen` 生成，填入 .env JITO_AUTH_UUID
+    pub jito_auth_uuid: Option<String>,
 
     // Confirmation
     pub confirm_timeout_secs: u64,
@@ -120,6 +123,7 @@ impl AppConfig {
                 env_parse("JITO_TIP_LAMPORTS", 10_000)),
             jito_sell_tip_lamports: env_parse("JITO_SELL_TIP_LAMPORTS",
                 env_parse("JITO_TIP_LAMPORTS", 10_000)),
+            jito_auth_uuid: std::env::var("JITO_AUTH_UUID").ok().filter(|s| !s.is_empty()),
             confirm_timeout_secs: env_parse("CONFIRM_TIMEOUT_SECS", 5),
             auto_sell_enabled: env_parse("AUTO_SELL_ENABLED", true),
             take_profit_percent: env_parse("TAKE_PROFIT_PERCENT", 15.0),

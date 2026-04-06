@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.3.6");
+    info!("   Solana 跟单交易系统 v1.3.7");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
         config.secondary_rpc_url.clone(),
         config.jito_block_engine_urls.clone(),
         config.jito_enabled,
+        config.jito_auth_uuid.clone(),
     ));
 
     // Pump.fun 处理器
