@@ -321,6 +321,28 @@ impl BuyConfirmer {
 
                 let mcap_str = format_mcap_usd(mcap_usd);
 
+                // 后台获取代币名称并更新仓位信息
+                let rpc_info = rpc_client.clone();
+                let auto_sell_info = auto_sell.clone();
+                let mint_info = mint;
+                let entry_mcap_sol_val = mcap_sol;
+                tokio::spawn(async move {
+                    let ti = crate::utils::token_info::fetch_token_info(&rpc_info, &mint_info).await;
+                    let name = if ti.name.is_empty() {
+                        let ms = mint_info.to_string();
+                        format!("{}..{}", &ms[..6], &ms[ms.len()-4..])
+                    } else {
+                        ti.name.clone()
+                    };
+                    auto_sell_info.update_token_info(&mint_info, name, entry_mcap_sol_val);
+                });
+
+                // 临时名称（后台任务完成前使用）
+                let token_name_short = {
+                    let ms = mint.to_string();
+                    format!("{}..{}", &ms[..6], &ms[ms.len()-4..])
+                };
+
                 info!(
                     "✅ 持仓确认: {} | {:.0} tokens | 成本: {} | 市值: {} | PnL: {:.2}% | 滑点: {:.1}% | 价值: {:.4} SOL (${:.2}) | {:.0}ms",
                     mint_short,
@@ -337,7 +359,7 @@ impl BuyConfirmer {
                 // TG 推送买入确认
                 tg.send(TgEvent::BuyConfirmed {
                     mint,
-                    token_name: format!("{}..{}", &mint.to_string()[..6], &mint.to_string()[mint.to_string().len() - 4..]),
+                    token_name: token_name_short,
                     spent_sol: buy_sol,
                     cost_price_usd: cost_usd.clone(),
                     mcap_usd: mcap_str,

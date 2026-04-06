@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// 全局配置，从 .env 加载
@@ -37,6 +37,7 @@ pub struct AppConfig {
     pub compute_units: u32,
     pub priority_fee_micro_lamport: u64,
     /// 目标钱包最小买入 SOL 数（过滤小额噪音），0 表示不过滤
+    /// .env: MIN_TARGET_BUY_SOL=0.5
     pub min_target_buy_sol: f64,
 
     // Jito
@@ -110,7 +111,7 @@ impl AppConfig {
                 env_parse("SLIPPAGE_BPS", 1500)),
             compute_units: env_parse("COMPUTE_UNITS", 400_000),
             priority_fee_micro_lamport: env_parse("PRIORITY_FEE_MICRO_LAMPORT", 5000),
-            min_target_buy_sol: env_parse("MIN_TARGET_BUY_SOL", 0.0),
+            min_target_buy_sol: env_parse("MIN_TARGET_BUY_SOL", 0.5),
             jito_enabled: env_parse("JITO_ENABLED", false),
             jito_block_engine_urls: std::env::var("JITO_BLOCK_ENGINE_URL")
                 .ok()
@@ -174,6 +175,10 @@ fn load_f64(atom: &AtomicU64) -> f64 {
     f64::from_bits(atom.load(Ordering::Relaxed))
 }
 
+/// 卖出模式: 0=止盈止损模式(TP/SL/Trailing), 1=跟卖模式(Follow Smart Money Sell)
+pub const SELL_MODE_TP_SL: u8 = 0;
+pub const SELL_MODE_FOLLOW: u8 = 1;
+
 /// 可在运行时通过 TG /set 修改的参数
 pub struct DynConfig {
     buy_sol_amount: AtomicU64,        // f64 bits
@@ -186,6 +191,10 @@ pub struct DynConfig {
     consensus_min_wallets: AtomicU64,
     jito_buy_tip_lamports: AtomicU64,
     jito_sell_tip_lamports: AtomicU64,
+    /// 卖出模式: SELL_MODE_TP_SL(0) 或 SELL_MODE_FOLLOW(1)
+    sell_mode: AtomicU8,
+    /// 目标钱包最小买入 SOL 过滤
+    min_target_buy_sol: AtomicU64,    // f64 bits
     /// 跟踪钱包列表（需要重启 gRPC 订阅才生效）
     pub target_wallets: RwLock<Vec<Pubkey>>,
     /// 代币黑名单
@@ -205,6 +214,8 @@ impl DynConfig {
             consensus_min_wallets: AtomicU64::new(config.consensus_min_wallets as u64),
             jito_buy_tip_lamports: AtomicU64::new(config.jito_buy_tip_lamports),
             jito_sell_tip_lamports: AtomicU64::new(config.jito_sell_tip_lamports),
+            sell_mode: AtomicU8::new(SELL_MODE_TP_SL),
+            min_target_buy_sol: AtomicU64::new(config.min_target_buy_sol.to_bits()),
             target_wallets: RwLock::new(config.target_wallets.clone()),
             blocklist: dashmap::DashSet::new(),
         })
@@ -222,6 +233,10 @@ impl DynConfig {
     pub fn consensus_min_wallets(&self) -> usize { self.consensus_min_wallets.load(Ordering::Relaxed) as usize }
     pub fn jito_buy_tip_lamports(&self) -> u64 { self.jito_buy_tip_lamports.load(Ordering::Relaxed) }
     pub fn jito_sell_tip_lamports(&self) -> u64 { self.jito_sell_tip_lamports.load(Ordering::Relaxed) }
+    pub fn sell_mode(&self) -> u8 { self.sell_mode.load(Ordering::Relaxed) }
+    pub fn is_follow_sell_mode(&self) -> bool { self.sell_mode() == SELL_MODE_FOLLOW }
+    pub fn min_target_buy_sol(&self) -> f64 { load_f64(&self.min_target_buy_sol) }
+    pub fn min_target_buy_lamports(&self) -> u64 { (self.min_target_buy_sol() * 1e9) as u64 }
 
     // Setters
     pub fn set_buy_sol_amount(&self, v: f64) { store_f64(&self.buy_sol_amount, v); }
@@ -234,6 +249,8 @@ impl DynConfig {
     pub fn set_consensus_min_wallets(&self, v: usize) { self.consensus_min_wallets.store(v as u64, Ordering::Relaxed); }
     pub fn set_jito_buy_tip_lamports(&self, v: u64) { self.jito_buy_tip_lamports.store(v, Ordering::Relaxed); }
     pub fn set_jito_sell_tip_lamports(&self, v: u64) { self.jito_sell_tip_lamports.store(v, Ordering::Relaxed); }
+    pub fn set_sell_mode(&self, v: u8) { self.sell_mode.store(v, Ordering::Relaxed); }
+    pub fn set_min_target_buy_sol(&self, v: f64) { store_f64(&self.min_target_buy_sol, v); }
 
     /// 是否已拉黑该代币
     pub fn is_blocked(&self, mint: &Pubkey) -> bool { self.blocklist.contains(mint) }

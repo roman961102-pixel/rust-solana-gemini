@@ -53,6 +53,10 @@ pub struct Position {
     pub token_amount: u64,
     pub entry_price_sol: f64,
 
+    // 代币信息（确认后填充）
+    pub token_name: String,
+    pub entry_mcap_sol: f64,
+
     // 追踪止损
     pub highest_price: f64,
     pub current_price: f64,
@@ -84,6 +88,8 @@ impl Position {
             entry_sol_amount,
             token_amount: 0,
             entry_price_sol,
+            token_name: String::new(),
+            entry_mcap_sol: 0.0,
             highest_price: entry_price_sol,
             current_price: entry_price_sol,
             created_at: Instant::now(),
@@ -300,6 +306,8 @@ pub enum SellReason {
     TrailingStop,
     MaxLifetime,
     Manual,
+    /// 跟聪明钱卖出（目标钱包卖出同一代币时触发）
+    FollowSell,
 }
 
 impl std::fmt::Display for SellReason {
@@ -310,6 +318,7 @@ impl std::fmt::Display for SellReason {
             SellReason::TrailingStop => write!(f, "TRAILING_STOP"),
             SellReason::MaxLifetime => write!(f, "MAX_LIFETIME"),
             SellReason::Manual => write!(f, "MANUAL"),
+            SellReason::FollowSell => write!(f, "FOLLOW_SELL"),
         }
     }
 }

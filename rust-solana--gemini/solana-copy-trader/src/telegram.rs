@@ -1,14 +1,16 @@
 use solana_sdk::pubkey::Pubkey;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::autosell::{AutoSellManager, SellReason, SellSignal};
-use crate::config::{AppConfig, DynConfig};
+use crate::config::{AppConfig, DynConfig, SELL_MODE_TP_SL, SELL_MODE_FOLLOW};
 use crate::consensus::ConsensusEngine;
+use crate::tx::confirm::{format_price_gmgn, format_mcap_usd};
 use crate::tx::sell_executor::SellExecutor;
+use crate::utils::sol_price::SolUsdPrice;
 
 // ============================================
 // 通知事件
@@ -71,36 +73,6 @@ impl TgStats {
 }
 
 // ============================================
-// Mute Flags (bitfield)
-// ============================================
-
-const MUTE_SIGNALS: u8 = 1;
-const MUTE_BUYS: u8 = 2;
-const MUTE_SELLS: u8 = 4;
-
-struct MuteState(AtomicU8);
-
-impl MuteState {
-    fn new() -> Self { Self(AtomicU8::new(0)) }
-    fn is_muted(&self, flag: u8) -> bool { self.0.load(Ordering::Relaxed) & flag != 0 }
-    fn mute(&self, flag: u8) { self.0.fetch_or(flag, Ordering::Relaxed); }
-    fn mute_all(&self) { self.0.store(MUTE_SIGNALS | MUTE_BUYS | MUTE_SELLS, Ordering::Relaxed); }
-    fn unmute_all(&self) { self.0.store(0, Ordering::Relaxed); }
-    fn signals_muted(&self) -> bool { self.is_muted(MUTE_SIGNALS) }
-    fn buys_muted(&self) -> bool { self.is_muted(MUTE_BUYS) }
-    fn sells_muted(&self) -> bool { self.is_muted(MUTE_SELLS) }
-    fn status_text(&self) -> String {
-        let v = self.0.load(Ordering::Relaxed);
-        if v == 0 { return "全部开启".into(); }
-        let mut parts = vec![];
-        if v & MUTE_SIGNALS != 0 { parts.push("共识"); }
-        if v & MUTE_BUYS != 0 { parts.push("买入"); }
-        if v & MUTE_SELLS != 0 { parts.push("卖出"); }
-        format!("已静音: {}", parts.join(", "))
-    }
-}
-
-// ============================================
 // TgBot
 // ============================================
 
@@ -116,7 +88,7 @@ pub struct TgBot {
     sell_executor: Arc<SellExecutor>,
     is_running: Arc<AtomicBool>,
     stats: Arc<TgStats>,
-    mute: MuteState,
+    sol_usd: SolUsdPrice,
     event_rx: Option<mpsc::UnboundedReceiver<TgEvent>>,
 }
 
@@ -131,6 +103,7 @@ impl TgBot {
         sell_executor: Arc<SellExecutor>,
         is_running: Arc<AtomicBool>,
         stats: Arc<TgStats>,
+        sol_usd: SolUsdPrice,
         event_rx: mpsc::UnboundedReceiver<TgEvent>,
     ) -> Self {
         let token = config.telegram_bot_token.clone().unwrap_or_default();
@@ -140,8 +113,7 @@ impl TgBot {
             http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().unwrap(),
             auto_sell, consensus, config, dyn_config,
             sell_signal_tx, sell_executor,
-            is_running, stats,
-            mute: MuteState::new(),
+            is_running, stats, sol_usd,
             event_rx: Some(event_rx),
         }
     }
@@ -194,25 +166,23 @@ impl TgBot {
                 {"command": "start", "description": "启动监听"},
                 {"command": "stop", "description": "停止监听"},
                 {"command": "status", "description": "运行状态"},
-                {"command": "pos", "description": "查看持仓"},
+                {"command": "pos", "description": "持仓列表"},
                 {"command": "sellall", "description": "一键清仓"},
+                {"command": "sellmode", "description": "切换卖出模式"},
                 {"command": "stats", "description": "运行统计"},
                 {"command": "set", "description": "查看/修改配置"},
                 {"command": "wallet", "description": "查看余额"},
                 {"command": "wallets", "description": "跟踪钱包列表"},
                 {"command": "block", "description": "拉黑代币"},
                 {"command": "blocklist", "description": "黑名单列表"},
-                {"command": "mute", "description": "静音通知"},
-                {"command": "unmute", "description": "恢复通知"},
                 {"command": "pnl", "description": "盈亏汇总"},
-                {"command": "history", "description": "交易记录"},
             ]
         });
         match self.http.post(&url).json(&commands).send().await {
             Ok(resp) => {
                 if let Ok(v) = resp.json::<serde_json::Value>().await {
                     if v["ok"].as_bool() == Some(true) {
-                        info!("TG Bot Menu 命令已注册 (15 个)");
+                        info!("TG Bot Menu 命令已注册 (13 个)");
                     } else {
                         warn!("TG setMyCommands 失败: {}", v);
                     }
@@ -279,17 +249,10 @@ impl TgBot {
                     "/start" => self.cmd_start().await,
                     "/stop" => self.cmd_stop().await,
                     "/status" => self.cmd_status().await,
-                    // 以下命令需要 BOT 在线（is_running=true）
-                    _ if !self.is_running.load(Ordering::Relaxed) && matches!(cmd,
-                        "/pos" | "/sellall" | "/set" | "/stats" | "/wallet" | "/wallets" |
-                        "/addwallet" | "/rmwallet" | "/block" | "/unblock" | "/blocklist" |
-                        "/mute" | "/unmute" | "/pnl" | "/history"
-                    ) => {
-                        self.send_msg("⚠️ 监听未启动，请先发送 /start").await;
-                    }
                     "/pos" => self.cmd_positions().await,
                     "/stats" => self.cmd_stats().await,
                     "/sellall" => self.cmd_sellall().await,
+                    "/sellmode" => self.cmd_sellmode().await,
                     "/set" => self.cmd_set(&parts[1..]).await,
                     "/wallet" => self.cmd_wallet().await,
                     "/wallets" => self.cmd_wallets().await,
@@ -298,10 +261,7 @@ impl TgBot {
                     "/block" => self.cmd_block(&parts[1..]).await,
                     "/unblock" => self.cmd_unblock(&parts[1..]).await,
                     "/blocklist" => self.cmd_blocklist().await,
-                    "/mute" => self.cmd_mute(&parts[1..]).await,
-                    "/unmute" => { self.mute.unmute_all(); self.send_msg("🔔 所有通知已恢复").await; }
                     "/pnl" => self.cmd_pnl().await,
-                    "/history" => self.cmd_history().await,
                     _ => {
                         // 检测粘贴的 mint 地址 → 弹出买入按钮
                         if text.len() >= 32 && text.len() <= 44 {
@@ -335,6 +295,14 @@ impl TgBot {
                 }
             } else if let Some(mint_str) = data.strip_prefix("refresh:") {
                 self.cb_refresh(cb_id, mid, mint_str).await;
+            } else if data == "refresh_pos_list" {
+                self.cb_refresh_pos_list(cb_id, mid).await;
+            } else if let Some(rest) = data.strip_prefix("sellmode:") {
+                let new_mode = if rest == "follow" { SELL_MODE_FOLLOW } else { SELL_MODE_TP_SL };
+                self.dyn_config.set_sell_mode(new_mode);
+                let mode_text = if new_mode == SELL_MODE_FOLLOW { "跟卖模式" } else { "止盈止损模式" };
+                self.answer_cb(cb_id, &format!("已切换: {}", mode_text)).await;
+                self.cmd_sellmode_edit(mid).await;
             } else if let Some(rest) = data.strip_prefix("buy:") {
                 // buy:LAMPORTS:MINT
                 let parts: Vec<&str> = rest.splitn(2, ':').collect();
@@ -364,26 +332,27 @@ impl TgBot {
         let running = self.is_running.load(Ordering::Relaxed);
         let positions = self.auto_sell.get_active_positions();
         let pending = self.consensus.pending_count();
+        let sell_mode_text = if dc.is_follow_sell_mode() { "跟卖模式" } else { "止盈止损模式" };
 
         let text = format!(
             "📊 <b>运行状态</b>\n\
              \n\
              状态: {}\n\
              钱包: <code>{}</code>\n\
-             买入: {} SOL | 滑点: {} bps\n\
-             卖出滑点: {} bps\n\
+             买入: {} SOL | 最小跟单: {} SOL\n\
+             滑点: {} bps | 卖出滑点: {} bps\n\
+             卖出模式: {}\n\
              止盈: {}% | 止损: {}% | 追踪: {}%\n\
              最大持仓: {}s\n\
-             仓位: {} | 待共识: {}\n\
-             通知: {}",
+             仓位: {} | 待共识: {}",
             if running { "🟢 运行中" } else { "🔴 已停止" },
             self.config.pubkey,
-            dc.buy_sol_amount(), dc.slippage_bps(),
-            dc.sell_slippage_bps(),
+            dc.buy_sol_amount(), dc.min_target_buy_sol(),
+            dc.slippage_bps(), dc.sell_slippage_bps(),
+            sell_mode_text,
             dc.take_profit_percent(), dc.stop_loss_percent(), dc.trailing_stop_percent(),
             dc.max_hold_seconds(),
             positions.len(), pending,
-            self.mute.status_text(),
         );
         self.send_msg(&text).await;
     }
@@ -394,11 +363,9 @@ impl TgBot {
             self.send_msg("📭 当前无持仓").await;
             return;
         }
-        for pos in &positions {
-            let text = format_position_card(pos);
-            let kb = position_keyboard(&pos.token_mint.to_string());
-            self.send_msg_kb(&text, Some(kb)).await;
-        }
+        let text = self.format_position_list(&positions);
+        let kb = position_list_keyboard(&positions);
+        self.send_msg_kb(&text, Some(kb)).await;
     }
 
     async fn cmd_stats(&self) {
@@ -439,6 +406,44 @@ impl TgBot {
         self.send_msg(&format!("🔴 已发送 {} 个清仓信号", count)).await;
     }
 
+    async fn cmd_sellmode(&self) {
+        let current = self.dyn_config.sell_mode();
+        let (cur_text, other_text, other_data) = if current == SELL_MODE_FOLLOW {
+            ("跟卖模式 (聪明钱卖出时跟卖)", "切换到止盈止损模式", "sellmode:tpsl")
+        } else {
+            ("止盈止损模式 (TP/SL/追踪止损)", "切换到跟卖模式", "sellmode:follow")
+        };
+        let text = format!(
+            "🔄 <b>卖出模式</b>\n\n当前: <b>{}</b>\n\n两种模式互斥，只能启用一种:",
+            cur_text,
+        );
+        let kb = serde_json::json!({
+            "inline_keyboard": [[
+                {"text": other_text, "callback_data": other_data},
+            ]]
+        });
+        self.send_msg_kb(&text, Some(kb)).await;
+    }
+
+    async fn cmd_sellmode_edit(&self, mid: i64) {
+        let current = self.dyn_config.sell_mode();
+        let (cur_text, other_text, other_data) = if current == SELL_MODE_FOLLOW {
+            ("跟卖模式 (聪明钱卖出时跟卖)", "切换到止盈止损模式", "sellmode:tpsl")
+        } else {
+            ("止盈止损模式 (TP/SL/追踪止损)", "切换到跟卖模式", "sellmode:follow")
+        };
+        let text = format!(
+            "🔄 <b>卖出模式</b>\n\n当前: <b>{}</b>\n\n两种模式互斥，只能启用一种:",
+            cur_text,
+        );
+        let kb = serde_json::json!({
+            "inline_keyboard": [[
+                {"text": other_text, "callback_data": other_data},
+            ]]
+        });
+        self.edit_msg(mid, &text, Some(kb)).await;
+    }
+
     async fn cmd_set(&self, args: &[&str]) {
         let dc = &self.dyn_config;
         if args.is_empty() {
@@ -446,6 +451,7 @@ impl TgBot {
                 "⚙️ <b>当前配置</b>\n\
                  \n\
                  buy = {} SOL\n\
+                 min_buy = {} SOL\n\
                  tp = {}%\n\
                  sl = {}%\n\
                  trailing = {}%\n\
@@ -458,6 +464,7 @@ impl TgBot {
                  \n\
                  用法: <code>/set buy 0.01</code>",
                 dc.buy_sol_amount(),
+                dc.min_target_buy_sol(),
                 dc.take_profit_percent(), dc.stop_loss_percent(), dc.trailing_stop_percent(),
                 dc.slippage_bps(), dc.sell_slippage_bps(),
                 dc.consensus_min_wallets(),
@@ -476,6 +483,7 @@ impl TgBot {
 
         let result: Result<String, String> = match key.as_str() {
             "buy" => val_str.parse::<f64>().map(|v| { dc.set_buy_sol_amount(v); format!("buy = {} SOL", v) }).map_err(|e| e.to_string()),
+            "min_buy" => val_str.parse::<f64>().map(|v| { dc.set_min_target_buy_sol(v); format!("min_buy = {} SOL", v) }).map_err(|e| e.to_string()),
             "tp" => val_str.parse::<f64>().map(|v| { dc.set_take_profit_percent(v); format!("tp = {}%", v) }).map_err(|e| e.to_string()),
             "sl" => val_str.parse::<f64>().map(|v| { dc.set_stop_loss_percent(v.abs()); format!("sl = {}%", v.abs()) }).map_err(|e| e.to_string()),
             "trailing" => val_str.parse::<f64>().map(|v| { dc.set_trailing_stop_percent(v); format!("trailing = {}%", v) }).map_err(|e| e.to_string()),
@@ -609,28 +617,40 @@ impl TgBot {
         }
     }
 
-    async fn cmd_mute(&self, args: &[&str]) {
-        if args.is_empty() {
-            self.send_msg("用法: /mute signals|buys|sells|all").await;
+    async fn cmd_pnl(&self) {
+        let positions = self.auto_sell.get_active_positions();
+        if positions.is_empty() {
+            self.send_msg("📭 当前无持仓，无盈亏数据").await;
             return;
         }
-        match args[0] {
-            "signals" => { self.mute.mute(MUTE_SIGNALS); self.send_msg("🔇 共识信号已静音").await; }
-            "buys" => { self.mute.mute(MUTE_BUYS); self.send_msg("🔇 买入通知已静音").await; }
-            "sells" => { self.mute.mute(MUTE_SELLS); self.send_msg("🔇 卖出通知已静音").await; }
-            "all" => { self.mute.mute_all(); self.send_msg("🔇 全部已静音").await; }
-            _ => { self.send_msg("未知类型，可选: signals buys sells all").await; }
-        };
-    }
-
-    async fn cmd_pnl(&self) {
-        // TODO: 需要 trades.json 持久化支持
-        self.send_msg("📊 PnL 统计功能开发中\n需要交易记录持久化支持").await;
-    }
-
-    async fn cmd_history(&self) {
-        // TODO: 需要 trades.json 持久化支持
-        self.send_msg("📜 历史记录功能开发中\n需要交易记录持久化支持").await;
+        let sol_price = self.sol_usd.get();
+        let mut total_cost_sol = 0.0_f64;
+        let mut total_value_sol = 0.0_f64;
+        let mut count = 0;
+        for pos in &positions {
+            if pos.entry_price_sol > 0.0 && pos.current_price > 0.0 {
+                let cost = pos.entry_sol_amount as f64 / 1e9;
+                let value = cost * (1.0 + pos.pnl_percent() / 100.0);
+                total_cost_sol += cost;
+                total_value_sol += value;
+                count += 1;
+            }
+        }
+        let total_pnl_sol = total_value_sol - total_cost_sol;
+        let total_pnl_pct = if total_cost_sol > 0.0 { (total_pnl_sol / total_cost_sol) * 100.0 } else { 0.0 };
+        let sign = if total_pnl_sol >= 0.0 { "+" } else { "" };
+        let icon = if total_pnl_sol >= 0.0 { "🟢" } else { "🔴" };
+        self.send_msg(&format!(
+            "📊 <b>盈亏汇总</b>\n\n\
+             持仓数: {}\n\
+             总投入: {:.4} SOL (${:.2})\n\
+             总价值: {:.4} SOL (${:.2})\n\
+             {} 总PnL: {}{:.4} SOL ({}{:.2}%)",
+            count,
+            total_cost_sol, total_cost_sol * sol_price,
+            total_value_sol, total_value_sol * sol_price,
+            icon, sign, total_pnl_sol, sign, total_pnl_pct,
+        )).await;
     }
 
     async fn show_buy_buttons(&self, mint: &Pubkey) {
@@ -666,7 +686,7 @@ impl TgBot {
         };
         match self.auto_sell.get_position(&mint) {
             Some(pos) => {
-                let text = format_position_card(&pos);
+                let text = format_position_card(&pos, self.sol_usd.get());
                 let kb = position_keyboard(mint_str);
                 self.edit_msg(mid, &text, Some(kb)).await;
                 self.answer_cb(cb_id, "已刷新").await;
@@ -675,20 +695,24 @@ impl TgBot {
         }
     }
 
+    async fn cb_refresh_pos_list(&self, cb_id: &str, mid: i64) {
+        let positions = self.auto_sell.get_active_positions();
+        if positions.is_empty() {
+            self.edit_msg(mid, "📭 当前无持仓", None).await;
+            self.answer_cb(cb_id, "已刷新").await;
+            return;
+        }
+        let text = self.format_position_list(&positions);
+        let kb = position_list_keyboard(&positions);
+        self.edit_msg(mid, &text, Some(kb)).await;
+        self.answer_cb(cb_id, "已刷新").await;
+    }
+
     // ============================================
     // 通知事件
     // ============================================
 
     async fn handle_event(&self, event: TgEvent) {
-        match &event {
-            TgEvent::ConsensusReached { .. } if self.mute.signals_muted() => return,
-            TgEvent::BuySubmitted { .. } | TgEvent::BuyConfirmed { .. } | TgEvent::BuyFailed { .. }
-                if self.mute.buys_muted() => return,
-            TgEvent::SellSuccess { .. } | TgEvent::SellFailed { .. }
-                if self.mute.sells_muted() => return,
-            _ => {}
-        }
-
         match event {
             TgEvent::ConsensusReached { mint, wallets } => {
                 let ms = mint.to_string();
@@ -740,13 +764,50 @@ impl TgBot {
             }
         }
     }
+
+    /// 格式化持仓列表（详细版）
+    fn format_position_list(&self, positions: &[crate::autosell::Position]) -> String {
+        let sol_price = self.sol_usd.get();
+        let mut text = format!("📊 <b>持仓列表</b> ({}个)\n", positions.len());
+        for (i, pos) in positions.iter().enumerate() {
+            let ms = pos.token_mint.to_string();
+            let pnl = pos.pnl_percent();
+            let icon = if pnl >= 0.0 { "🟢" } else { "🔴" };
+            let sign = if pnl >= 0.0 { "+" } else { "" };
+            let held = fmt_time(pos.held_seconds());
+            let name = if pos.token_name.is_empty() {
+                format!("{}..{}", &ms[..6], &ms[ms.len()-4..])
+            } else {
+                pos.token_name.clone()
+            };
+
+            // 成本价
+            let cost_usd = format_price_gmgn(pos.entry_price_sol * sol_price);
+            // 入场市值
+            let entry_mcap = if pos.entry_mcap_sol > 0.0 {
+                format_mcap_usd(pos.entry_mcap_sol * sol_price)
+            } else {
+                "N/A".to_string()
+            };
+            // 当前市值（从当前价格推算: current_price * 10亿总供应）
+            let current_mcap_sol = pos.current_price * 1_000_000_000.0;
+            let current_mcap = format_mcap_usd(current_mcap_sol * sol_price);
+
+            text.push_str(&format!(
+                "\n{}. {} <b>{}</b>\n   成本价: {} | 入场市值: {}\n   当前市值: {} | PnL: {}{:.2}% | {}\n",
+                i + 1, icon, name, cost_usd, entry_mcap,
+                current_mcap, sign, pnl, held,
+            ));
+        }
+        text
+    }
 }
 
 // ============================================
 // 辅助函数
 // ============================================
 
-fn format_position_card(pos: &crate::autosell::Position) -> String {
+fn format_position_card(pos: &crate::autosell::Position, sol_price: f64) -> String {
     let ms = pos.token_mint.to_string();
     let pnl = pos.pnl_percent();
     let held = fmt_time(pos.held_seconds());
@@ -754,10 +815,23 @@ fn format_position_card(pos: &crate::autosell::Position) -> String {
     let state = if pos.state == crate::autosell::PositionState::Active { "✅" } else { "⏳" };
     let icon = if pnl >= 0.0 { "🟢" } else { "🔴" };
     let sign = if pnl >= 0.0 { "+" } else { "" };
+    let name = if pos.token_name.is_empty() {
+        format!("{}..{}", &ms[..6], &ms[ms.len()-4..])
+    } else {
+        pos.token_name.clone()
+    };
+    let cost_usd = format_price_gmgn(pos.entry_price_sol * sol_price);
+    let entry_mcap = if pos.entry_mcap_sol > 0.0 {
+        format_mcap_usd(pos.entry_mcap_sol * sol_price)
+    } else {
+        "N/A".to_string()
+    };
+    let current_mcap_sol = pos.current_price * 1_000_000_000.0;
+    let current_mcap = format_mcap_usd(current_mcap_sol * sol_price);
 
     format!(
-        "{} <code>{}..{}</code> {}\n花费: {:.4} SOL\nPnL: {}{:.2}% | 持仓: {}",
-        icon, &ms[..6], &ms[ms.len()-4..], state, spent, sign, pnl, held,
+        "{} <b>{}</b> {}\n花费: {:.4} SOL | 成本价: {}\n入场市值: {} | 当前市值: {}\nPnL: {}{:.2}% | 持仓: {}",
+        icon, name, state, spent, cost_usd, entry_mcap, current_mcap, sign, pnl, held,
     )
 }
 
@@ -776,6 +850,27 @@ fn position_keyboard(mint_str: &str) -> serde_json::Value {
             ],
         ]
     })
+}
+
+/// 持仓列表键盘：每个代币一行卖出按钮 + 底部刷新
+fn position_list_keyboard(positions: &[crate::autosell::Position]) -> serde_json::Value {
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for pos in positions {
+        let ms = pos.token_mint.to_string();
+        let name = if pos.token_name.is_empty() {
+            format!("{}..{}", &ms[..6], &ms[ms.len()-4..])
+        } else {
+            pos.token_name.clone()
+        };
+        rows.push(serde_json::json!([
+            {"text": format!("卖出 {}", name), "callback_data": format!("sell:100:{}", ms)},
+            {"text": "📊", "url": format!("https://gmgn.ai/sol/token/{}", ms)},
+        ]));
+    }
+    rows.push(serde_json::json!([
+        {"text": "🔄 刷新列表", "callback_data": "refresh_pos_list"},
+    ]));
+    serde_json::json!({"inline_keyboard": rows})
 }
 
 fn fmt_time(secs: u64) -> String {

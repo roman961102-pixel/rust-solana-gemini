@@ -23,7 +23,11 @@ struct SavedPosition {
     buy_signature: String,
     sell_attempts: u32,
     /// 代币名称
+    #[serde(default)]
     token_name: String,
+    /// 入场市值 (SOL)
+    #[serde(default)]
+    entry_mcap_sol: f64,
 }
 
 /// 保存所有活跃仓位到 positions.json
@@ -50,7 +54,8 @@ pub fn save_positions(positions: &DashMap<Pubkey, Position>) {
             source_wallet: p.source_wallet.to_string(),
             buy_signature: p.buy_signature.clone(),
             sell_attempts: p.sell_attempts,
-            token_name: String::new(),
+            token_name: p.token_name.clone(),
+            entry_mcap_sol: p.entry_mcap_sol,
         })
         .collect();
 

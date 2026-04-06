@@ -414,15 +414,31 @@ impl AutoSellManager {
     // 退出条件检查
     // ============================================
 
+    /// 更新仓位的代币信息（确认后填充）
+    pub fn update_token_info(&self, mint: &Pubkey, token_name: String, entry_mcap_sol: f64) {
+        if let Some(mut pos) = self.positions.get_mut(mint) {
+            pos.token_name = token_name;
+            pos.entry_mcap_sol = entry_mcap_sol;
+        }
+    }
+
     /// 使用 DynConfig（运行时可修改参数）检查退出条件
+    /// 跟卖模式(sell_mode=1)时跳过 TP/SL/Trailing，仅保留 MaxLifetime 安全兜底
     fn check_exit_conditions_dyn(pos: &Position, dc: &DynConfig) -> Option<SellSignal> {
         let pnl = pos.pnl_percent();
         let mint = pos.token_mint;
 
+        // MaxLifetime 始终生效（安全兜底）
         let max_hold = dc.max_hold_seconds();
         if max_hold > 0 && pos.held_seconds() >= max_hold && pos.can_sell() {
             return Some(SellSignal { token_mint: mint, reason: SellReason::MaxLifetime, current_price: pos.current_price, pnl_percent: pnl });
         }
+
+        // 跟卖模式: 不检查 TP/SL/Trailing（由聪明钱卖出信号触发）
+        if dc.is_follow_sell_mode() {
+            return None;
+        }
+
         if pos.can_check_stop_loss() && pnl <= -dc.stop_loss_percent() {
             return Some(SellSignal { token_mint: mint, reason: SellReason::StopLoss, current_price: pos.current_price, pnl_percent: pnl });
         }

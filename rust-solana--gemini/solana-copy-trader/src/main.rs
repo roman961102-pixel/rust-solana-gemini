@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use autosell::{AutoSellManager, Position, SellSignal};
+use autosell::{AutoSellManager, Position, SellReason, SellSignal};
 use config::{AppConfig, DynConfig};
 use consensus::{
     ConsensusEngine,
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.4.9");
+    info!("   Solana 跟单交易系统 v1.5.0");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -224,6 +224,7 @@ async fn main() -> Result<()> {
             sell_executor.clone(),
             is_running.clone(),
             tg_stats.clone(),
+            sol_usd.clone(),
             tg_event_rx,
         );
         info!("Telegram Bot V2 已配置 | chat_id: {}", config.telegram_chat_id.as_deref().unwrap_or(""));
@@ -370,13 +371,10 @@ async fn main() -> Result<()> {
     // ============================================
     // 主循环：检测 → 过滤 → 预取 → 执行/共识
     // ============================================
-    let min_buy_lamports = (config.min_target_buy_sol * 1e9) as u64;
-    if min_buy_lamports > 0 {
-        info!(
-            "买入量过滤: 忽略目标钱包 < {} SOL 的买入信号",
-            config.min_target_buy_sol,
-        );
-    }
+    info!(
+        "买入量过滤: 忽略目标钱包 < {} SOL 的买入信号 (可通过 /set min_buy 修改)",
+        config.min_target_buy_sol,
+    );
     let is_instant_mode = config.consensus_min_wallets <= 1;
     if is_running.load(Ordering::Relaxed) {
         info!("主循环已启动，等待 Pump.fun 内盘信号...\n");
@@ -424,19 +422,43 @@ async fn main() -> Result<()> {
         }
         sig_cache.insert(trade.signature.clone(), Instant::now());
 
-        // 只处理买入
+        // ===== 跟卖模式：聪明钱卖出 → 触发跟卖 =====
         if !trade.is_buy {
+            if dyn_config.is_follow_sell_mode() {
+                // 从指令提取 mint
+                if let Some((token_mint, _)) = extract_token_info(&trade) {
+                    // 检查是否持有该代币仓位
+                    if let Some(pos) = auto_sell_manager.get_position(&token_mint) {
+                        if pos.can_sell() {
+                            let wallet_str = trade.source_wallet.to_string();
+                            info!(
+                                "跟卖信号: {}..{} 卖出 {} | 触发跟卖",
+                                &wallet_str[..4], &wallet_str[wallet_str.len()-4..],
+                                &token_mint.to_string()[..12],
+                            );
+                            let signal = SellSignal {
+                                token_mint,
+                                reason: SellReason::FollowSell,
+                                current_price: pos.current_price,
+                                pnl_percent: pos.pnl_percent(),
+                            };
+                            let _ = sell_signal_tx.send(signal);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
-        // 买入量过滤（纯本地）
+        // ===== 买入量过滤（运行时可调，从 DynConfig 读取）=====
+        let min_buy_lamports = dyn_config.min_target_buy_lamports();
         if min_buy_lamports > 0 && trade.sol_amount_lamports > 0 {
             if trade.sol_amount_lamports < min_buy_lamports {
                 debug!(
-                    "跳过小额买入: {}.. 买入 {:.4} SOL < 阈值 {} SOL",
+                    "跳过小额买入: {}.. 买入 {:.4} SOL < 阈值 {:.2} SOL",
                     &trade.source_wallet.to_string()[..8],
                     trade.sol_amount_lamports as f64 / 1e9,
-                    config.min_target_buy_sol,
+                    dyn_config.min_target_buy_sol(),
                 );
                 continue;
             }
@@ -654,6 +676,7 @@ async fn execute_buy(
     let mut position = Position::new(
         *mint, buy_lamports, entry_price_sol, wallets[0],
     );
+    position.entry_mcap_sol = entry_mcap_sol;
 
     match buy_result {
         Ok((mirror, _)) => {
@@ -696,14 +719,6 @@ async fn execute_buy(
                             let sig_str = sig.to_string();
 
                             let buy_usd = sol_usd.sol_to_usd(buy_sol);
-
-                            // 后台获取代币名称
-                            let rpc_for_info = rpc_client.clone();
-                            let mint_for_info = *mint;
-                            tokio::spawn(async move {
-                                let ti = token_info::fetch_token_info(&rpc_for_info, &mint_for_info).await;
-                                info!("代币名称: {} ({})", ti.name, ti.symbol);
-                            });
 
                             let total_latency = detected_at.elapsed();
                             info!(
