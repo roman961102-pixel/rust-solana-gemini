@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.2");
+    info!("   Solana 跟单交易系统 v1.6.3");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -635,27 +635,44 @@ async fn execute_buy(
     let sol_price = sol_usd.get();
 
     // ===== 2 层优先级构建买入指令（零 RPC，无兜底）=====
-    // 1. 目标指令推算（零 RPC，从目标钱包指令数据推算价格，最快）
-    // 2. BC cache 命中（零 RPC，AMM 公式精确计算）
+    // 1. BC cache 命中（零 RPC，AMM 公式精确计算，最可靠）
+    // 2. 目标指令推算（零 RPC，需 max_sol_cost 合理性检查）
     // 无 BC RPC fetch — 任何 RPC 调用都会毁掉同区块机会
     let buy_result: Result<(processor::MirrorInstruction, u64), anyhow::Error> = if let Some(ref pf) = prefetched {
         if pf.mirror_accounts.is_empty() {
             Err(anyhow::anyhow!("无 mirror_accounts，无法构建指令"))
-        } else if target_instruction_data.len() >= 24 {
-            // ⚡ 最快: 从目标指令数据推算价格（零 RPC，零缓存依赖）
-            pumpfun.buy_from_target_instruction(
-                mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
-                &pf.mirror_accounts, target_instruction_data, config,
-            )
         } else if let Some(bc_state) = bc_cache.get(mint) {
-            // 次选: BC cache 命中，用 AMM 公式精确计算
+            // ⚡ 最优: BC cache 命中，AMM 公式精确计算（最可靠）
             let token_amount = bc_state.sol_to_token_quote(buy_lamports);
+            info!(
+                "指令构建: BC cache 命中 | price: {:.10} SOL | tokens: {}",
+                bc_state.price_sol(), token_amount,
+            );
             pumpfun.buy_from_cached_state(
                 mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
                 &pf.mirror_accounts, &bc_state, config,
             ).map(|mirror| (mirror, token_amount))
+        } else if target_instruction_data.len() >= 24 {
+            // 次选: 目标指令推算（零 RPC，零缓存依赖）
+            // 合理性检查: max_sol_cost 超过 100 SOL 视为"无限滑点"标志，不可用于价格推算
+            let target_max_sol = u64::from_le_bytes(
+                target_instruction_data[16..24].try_into().unwrap_or([0; 8])
+            );
+            let max_sol_f = target_max_sol as f64 / 1e9;
+            if max_sol_f > 100.0 {
+                warn!(
+                    "目标 max_sol_cost={:.2} SOL 不合理（疑似无限滑点），跳过目标指令推算",
+                    max_sol_f,
+                );
+                Err(anyhow::anyhow!("BC 缓存未命中 + 目标 max_sol_cost 不合理，跳过"))
+            } else {
+                pumpfun.buy_from_target_instruction(
+                    mint, &pf.user_ata, &pf.token_program, &pf.source_wallet,
+                    &pf.mirror_accounts, target_instruction_data, config,
+                )
+            }
         } else {
-            Err(anyhow::anyhow!("无目标指令数据且 BC 缓存未命中，跳过（不做 RPC 兜底）"))
+            Err(anyhow::anyhow!("BC 缓存未命中且无目标指令数据，跳过（不做 RPC 兜底）"))
         }
     } else {
         Err(anyhow::anyhow!("无预取数据，跳过"))
