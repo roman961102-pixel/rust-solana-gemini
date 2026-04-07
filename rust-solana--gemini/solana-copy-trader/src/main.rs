@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.0");
+    info!("   Solana 跟单交易系统 v1.6.1");
     info!("   gRPC + Pump.fun 直连 | fire-and-forget");
     info!("==============================================");
 
@@ -806,8 +806,19 @@ async fn execute_buy(
 // Token Mint 提取（纯本地，零 RPC）
 // ============================================
 
-/// 从 Pump.fun 指令 accountKeys 提取 mint (index 2) 和 token_program (index 8)
+/// 从交易中提取 mint 和 token_program
+/// 优先使用 CPI 检测已识别的 token_mint（Sandwich Bot 路由场景）
+/// 回退到 Pump.fun 标准指令布局 accountKeys[2] + accountKeys[8]
 fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
+    // CPI 检测已识别 mint（通过 PDA 验证）
+    if let Some(mint) = trade.token_mint {
+        // CPI 场景下 token_program 默认 TokenLegacy（Pump.fun 内盘绝大多数是 TokenLegacy）
+        let token_program = solana_sdk::pubkey::Pubkey::from_str(
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        ).unwrap();
+        return Some((mint, token_program));
+    }
+    // 标准 Pump.fun 直接调用布局
     if trade.instruction_accounts.len() >= 9 {
         let mint = trade.instruction_accounts[2];
         let token_program = trade.instruction_accounts[8];

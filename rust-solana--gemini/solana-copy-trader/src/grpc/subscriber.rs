@@ -436,6 +436,27 @@ impl GrpcSubscriber {
         }
 
         // ============================================
+        // 第 1.5 轮：CPI 检测 — account_keys 中发现 Pump.fun 但外部指令不匹配
+        // 场景：通过 Sandwich Bot / 聚合器间接调用 Pump.fun
+        // 预执行阶段无 meta（无 inner instructions），但 account_keys 完整
+        // 通过 account_keys 中的 Pump.fun 程序 ID + WSOL ATA 推断 buy/sell
+        // ============================================
+        let pumpfun_pubkey = Pubkey::from_str(PUMPFUN_PROGRAM).unwrap();
+        if account_keys.contains(&pumpfun_pubkey) {
+            // account_keys 中有 Pump.fun 程序 → CPI 调用
+            // 提取 mint：扫描 account_keys 中的非系统地址，验证 bonding curve PDA
+            if let Some(cpi_trade) = self.try_detect_cpi_pumpfun(
+                &account_keys,
+                &signature,
+                source_wallet,
+                meta,
+                tx_data,
+            ) {
+                return Ok(Some(cpi_trade));
+            }
+        }
+
+        // ============================================
         // 第二轮：扫描 inner instructions (CPI 调用)
         // 场景：通过 Jupiter 等聚合器间接调用 Pump.fun
         // ============================================
@@ -528,7 +549,108 @@ impl GrpcSubscriber {
             sol_amount_lamports,
             raw_transaction_bytes: Vec::new(), // 由 parse_transaction 填充
             is_pre_execution: false, // 由 parse_transaction 根据 meta 设置
+            token_mint: None, // 直接调用场景由 main.rs extract_token_info 提取
         }))
+    }
+
+    // ================================================================
+    // CPI 检测：通过 account_keys 识别经 Sandwich Bot 路由的 Pump.fun 交易
+    // ================================================================
+
+    /// 从 account_keys 中检测经 CPI 调用的 Pump.fun 交易
+    /// 原理：即使外部程序不是 Pump.fun，account_keys 中一定包含 Pump.fun 程序ID
+    ///       + bonding curve PDA + mint，可以在预执行阶段识别
+    fn try_detect_cpi_pumpfun(
+        &self,
+        account_keys: &[Pubkey],
+        signature: &str,
+        source_wallet: Pubkey,
+        meta: Option<&yellowstone_grpc_proto::prelude::TransactionStatusMeta>,
+        tx_data: &yellowstone_grpc_proto::prelude::Transaction,
+    ) -> Option<DetectedTrade> {
+        let pumpfun_pubkey = Pubkey::from_str(PUMPFUN_PROGRAM).ok()?;
+        let wsol_mint = Pubkey::from_str(WSOL_MINT).ok()?;
+
+        // 在 account_keys 中寻找 mint：
+        // Pump.fun bonding curve PDA = find_program_address([b"bonding-curve", mint], pumpfun_program)
+        // 扫描所有非系统地址，验证其 bonding curve PDA 是否也在 account_keys 中
+        let mut found_mint: Option<Pubkey> = None;
+        let system_addresses = [
+            pumpfun_pubkey,
+            wsol_mint,
+            solana_sdk::system_program::id(),
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?,
+            Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").ok()?,
+            Pubkey::from_str("SysvarRent111111111111111111111111111111111").ok()?,
+            Pubkey::from_str("11111111111111111111111111111111").ok()?,
+            Pubkey::from_str("ComputeBudget111111111111111111111111111111").ok()?,
+            // Pump.fun 已知固定地址
+            Pubkey::from_str("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf").ok()?, // GLOBAL
+            Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9i").ok()?,  // FEE_RECIPIENT
+            Pubkey::from_str("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1").ok()?, // EVENT_AUTHORITY
+        ];
+
+        for candidate in account_keys {
+            // 跳过已知系统/固定地址
+            if system_addresses.contains(candidate) {
+                continue;
+            }
+            // 跳过目标钱包自己
+            if self.target_wallets.contains(candidate) {
+                continue;
+            }
+
+            // 验证：candidate 作为 mint，其 bonding curve PDA 是否也在 account_keys 中
+            let (bc_pda, _) = Pubkey::find_program_address(
+                &[b"bonding-curve", candidate.as_ref()],
+                &pumpfun_pubkey,
+            );
+            if account_keys.contains(&bc_pda) {
+                found_mint = Some(*candidate);
+                break;
+            }
+        }
+
+        let mint = found_mint?;
+
+        // 判断 buy/sell：检查目标钱包的 WSOL ATA 是否在 account_keys 中
+        let wsol_ata = spl_associated_token_account::get_associated_token_address(
+            &source_wallet,
+            &wsol_mint,
+        );
+        let is_buy = account_keys.contains(&wsol_ata);
+
+        // 构建 instruction_accounts（从 account_keys 中提取 Pump.fun 相关账户）
+        // CPI 场景下无法精确还原 instruction 的 account 顺序
+        // 用完整 account_keys 传递给后续处理器
+        let instruction_accounts = account_keys.to_vec();
+
+        info!(
+            "CPI DETECTED: Pump.fun {} via wrapper | wallet: {}..{} | mint: {} | sig: {}..{}",
+            if is_buy { "BUY" } else { "SELL" },
+            &source_wallet.to_string()[..4],
+            &source_wallet.to_string()[source_wallet.to_string().len()-4..],
+            mint,
+            &signature[..8],
+            &signature[signature.len()-4..],
+        );
+
+        Some(DetectedTrade {
+            signature: signature.to_string(),
+            source_wallet,
+            trade_type: TradeType::Pumpfun,
+            is_buy,
+            program_id: pumpfun_pubkey,
+            instruction_data: Vec::new(), // CPI 场景无法提取 Pump.fun 指令数据
+            instruction_accounts,
+            all_account_keys: account_keys.to_vec(),
+            detected_at: Instant::now(),
+            sol_amount_lamports: 0, // CPI 场景无法提取 SOL 金额
+            raw_transaction_bytes: Self::serialize_transaction_from_proto(tx_data)
+                .unwrap_or_default(),
+            is_pre_execution: meta.is_none(),
+            token_mint: Some(mint), // CPI 检测已通过 PDA 验证识别了 mint
+        })
     }
 
     // ================================================================

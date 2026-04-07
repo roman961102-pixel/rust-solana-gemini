@@ -50,6 +50,8 @@ pub struct DetectedTrade {
     pub raw_transaction_bytes: Vec<u8>,
     /// 是否为预执行推送（meta 为空 = 交易尚未被 leader 执行 = 可 Backrun）
     pub is_pre_execution: bool,
+    /// CPI 检测时已识别的 token mint（直接调用时为 None，由 main.rs 从 instruction_accounts 提取）
+    pub token_mint: Option<Pubkey>,
 }
 
 /// 处理器构建的镜像交易指令
