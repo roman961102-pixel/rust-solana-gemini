@@ -160,8 +160,8 @@ impl TxSender {
             let b64 = tx_base64.clone();
             tokio::spawn(async move {
                 match Self::send_rpc_raw(&http, &url, &b64, true).await {
-                    Ok(sig) => info!("0slot 发送成功: {}", sig),
-                    Err(e) => debug!("0slot 发送失败: {}", e),
+                    Ok(sig) => info!("通道结果: 0slot ✅ | {}", sig),
+                    Err(e) => warn!("通道结果: 0slot ❌ | {}", e),
                 }
             });
             channel_count += 1;
@@ -174,8 +174,8 @@ impl TxSender {
             let b64 = tx_base64.clone();
             tokio::spawn(async move {
                 match Self::send_rpc_raw(&http, &url, &b64, true).await {
-                    Ok(sig) => debug!("Shyft RPC 发送成功: {}", sig),
-                    Err(e) => warn!("Shyft RPC 发送失败: {}", e),
+                    Ok(sig) => info!("通道结果: Shyft ✅ | {}", sig),
+                    Err(e) => warn!("通道结果: Shyft ❌ | {}", e),
                 }
             });
             channel_count += 1;
@@ -188,8 +188,8 @@ impl TxSender {
             let b64 = tx_base64.clone();
             tokio::spawn(async move {
                 match Self::send_rpc_raw(&http, &url2, &b64, true).await {
-                    Ok(sig) => debug!("Helius RPC 发送成功: {}", sig),
-                    Err(e) => debug!("Helius RPC 发送失败: {}", e),
+                    Ok(sig) => info!("通道结果: Helius ✅ | {}", sig),
+                    Err(e) => warn!("通道结果: Helius ❌ | {}", e),
                 }
             });
             channel_count += 1;
@@ -205,8 +205,8 @@ impl TxSender {
             let b58 = tx_b58.clone();
             tokio::spawn(async move {
                 match Self::send_jito_bundle_raw(&http, &jito_url1, &b58, &auth1).await {
-                    Ok(()) => debug!("Jito Bundle 发送成功"),
-                    Err(e) => debug!("Jito Bundle 发送失败: {}", e),
+                    Ok(()) => info!("通道结果: Jito Bundle ✅"),
+                    Err(e) => warn!("通道结果: Jito Bundle ❌ | {}", e),
                 }
             });
             channel_count += 1;
@@ -217,8 +217,8 @@ impl TxSender {
                 let b64 = tx_base64;
                 tokio::spawn(async move {
                     match Self::send_jito_tx_raw(&http, &jito_url2, &b64, &auth).await {
-                        Ok(()) => debug!("Jito TX 发送成功"),
-                        Err(e) => debug!("Jito TX 发送失败: {}", e),
+                        Ok(()) => info!("通道结果: Jito TX ✅"),
+                        Err(e) => warn!("通道结果: Jito TX ❌ | {}", e),
                     }
                 });
                 channel_count += 1;
